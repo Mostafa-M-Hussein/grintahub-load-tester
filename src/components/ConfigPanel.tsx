@@ -44,9 +44,6 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
     testing: false,
   });
 
-  // Manual test browser state (currently disabled in UI)
-  const [testBrowserId, setTestBrowserId] = useState<string | null>(null);
-  const [_testBrowserLoading, setTestBrowserLoading] = useState(false);
 
   // Save button feedback state
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
@@ -200,39 +197,6 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
     }
   };
 
-  // Open a manual test browser with proxy (currently disabled in UI)
-  const _handleOpenTestBrowser = async () => {
-    if (testBrowserId) {
-      // Close existing test browser first
-      await handleCloseTestBrowser();
-    }
-
-    setTestBrowserLoading(true);
-    try {
-      // Save config first to ensure proxy is configured
-      const keywords = keywordsText.split(',').map(k => k.trim()).filter(k => k.length > 0);
-      await api.configure({ ...localConfig, keywords });
-
-      const sessionId = await api.openTestBrowser();
-      setTestBrowserId(sessionId);
-    } catch (e) {
-      alert(`Failed to open test browser: ${e}`);
-    } finally {
-      setTestBrowserLoading(false);
-    }
-  };
-
-  // Close the manual test browser
-  const handleCloseTestBrowser = async () => {
-    if (testBrowserId) {
-      try {
-        await api.closeTestBrowser(testBrowserId);
-      } catch (e) {
-        console.error('Failed to close test browser:', e);
-      }
-      setTestBrowserId(null);
-    }
-  };
 
   const handleSave = async () => {
     setSaveStatus('saving');
