@@ -39,3 +39,9 @@ jobs:
           releaseBody: 'Windows build'
           releaseDraft: true
           prerelease: false
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grintahub-clicker-windows
+          path: src-tauri/target/release/bundle/nsis/*.exe
