@@ -44,9 +44,9 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
     testing: false,
   });
 
-  // Manual test browser state
+  // Manual test browser state (currently disabled in UI)
   const [testBrowserId, setTestBrowserId] = useState<string | null>(null);
-  const [testBrowserLoading, setTestBrowserLoading] = useState(false);
+  const [_testBrowserLoading, setTestBrowserLoading] = useState(false);
 
   // Save button feedback state
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
@@ -200,8 +200,8 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
     }
   };
 
-  // Open a manual test browser with proxy
-  const handleOpenTestBrowser = async () => {
+  // Open a manual test browser with proxy (currently disabled in UI)
+  const _handleOpenTestBrowser = async () => {
     if (testBrowserId) {
       // Close existing test browser first
       await handleCloseTestBrowser();
