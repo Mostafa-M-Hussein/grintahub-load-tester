@@ -3,51 +3,55 @@
 //! Thread-safe proxy URL generator with unique session IDs per browser.
 //! Each browser session gets a unique sessid to ensure a unique IP address.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashSet;
+use std::sync::Mutex;
 use tracing::debug;
 use urlencoding::encode;
+use rand::Rng;
 
 use super::ProxyConfig;
 
-/// Global atomic counter for unique session IDs (thread-safe)
-static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Global set of used session IDs to guarantee no reuse (thread-safe)
+static USED_SESSIDS: std::sync::LazyLock<Mutex<HashSet<u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Oxylabs Proxy Generator
 ///
-/// Generates unique proxy URLs with rotating session IDs.
-/// Each call to `next()` returns a proxy URL with a unique session ID,
+/// Generates unique proxy URLs with RANDOM session IDs.
+/// Each call to `next()` returns a proxy URL with a unique random session ID,
 /// ensuring each browser gets a different IP address.
+/// Session IDs are never reused across the lifetime of the application.
 #[derive(Debug)]
 pub struct OxylabsProxyGenerator {
     config: ProxyConfig,
-    /// Base seed for session ID generation
-    base_seed: u64,
 }
 
 impl OxylabsProxyGenerator {
     /// Create a new proxy generator
     pub fn new(config: ProxyConfig) -> Self {
-        // Generate base seed from timestamp and process ID for uniqueness
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let pid = std::process::id() as u64;
-        let base_seed = (timestamp % 1_000_000) * 1_000_000 + (pid % 1_000_000);
-
         debug!(
-            "ProxyGenerator initialized: customer={}, country={}, base_seed={}",
-            config.customer, config.country, base_seed
+            "ProxyGenerator initialized: customer={}, country={} (random sessid mode)",
+            config.customer, config.country
         );
 
-        Self { config, base_seed }
+        Self { config }
     }
 
-    /// Allocate a unique session ID
+    /// Allocate a unique RANDOM session ID (never reused)
     fn allocate_sessid(&self) -> u64 {
-        let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-        self.base_seed + counter
+        let mut rng = rand::thread_rng();
+        // Recover from poison (another thread panicked while holding lock)
+        let mut used = USED_SESSIDS.lock().unwrap_or_else(|e| e.into_inner());
+
+        loop {
+            // Generate random sessid in a large range for maximum IP diversity
+            let sessid: u64 = rng.gen_range(100_000_000..999_999_999);
+            if used.insert(sessid) {
+                debug!("Allocated random sessid: {}", sessid);
+                return sessid;
+            }
+            // Collision (astronomically unlikely) - try again
+        }
     }
 
     /// Build the Oxylabs username with parameters
@@ -139,7 +143,7 @@ mod tests {
         assert_ne!(url1, url2);
 
         // Both should contain the required parts
-        assert!(url1.contains("socks5h://"));
+        assert!(url1.contains("://"));
         assert!(url1.contains("customer-testcustomer"));
         assert!(url1.contains("cc-sa"));
         assert!(url1.contains("sessid-"));

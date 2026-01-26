@@ -497,7 +497,12 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
       </fieldset>
 
       <fieldset disabled={disabled}>
-        <legend>Keywords</legend>
+        <legend>
+          Keywords
+          <span className="keyword-count-badge">
+            {keywordsText.split(',').map(k => k.trim()).filter(k => k.length > 0).length}
+          </span>
+        </legend>
         <div className="form-group">
           <label>Search Keywords (comma-separated)</label>
           <textarea
@@ -506,6 +511,9 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
             placeholder="keyword1, keyword2, keyword3"
             rows={3}
           />
+          <small className="form-hint">
+            Each cycle rotates to the next keyword. After all keywords are used, it loops back.
+          </small>
         </div>
       </fieldset>
 

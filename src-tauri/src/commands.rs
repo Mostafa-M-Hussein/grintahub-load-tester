@@ -73,6 +73,7 @@ pub struct BotStatus {
     pub is_running: bool,
     pub active_sessions: usize,
     pub total_clicks: u64,
+    pub total_errors: u64,
     pub clicks_per_hour: f64,
 }
 
@@ -85,7 +86,8 @@ pub async fn get_bot_status(state: State<'_, AppState>) -> Result<BotStatus, Str
     Ok(BotStatus {
         is_running: state.is_running.load(Ordering::Relaxed),
         active_sessions: sessions,
-        total_clicks: stats.total_clicks,
+        total_clicks: stats.total_success, // Successful ad clicks only
+        total_errors: stats.total_errors,
         clicks_per_hour: stats.clicks_per_hour,
     })
 }
@@ -176,6 +178,9 @@ pub async fn start_bot(state: State<'_, AppState>) -> Result<(), String> {
 
     state.is_running.store(true, Ordering::Relaxed);
 
+    // Reset global stats for fresh run (so clicks_per_hour reflects this run only)
+    state.global_stats.reset();
+
     // Extract Google account from config if available
     // The frontend stores the Google password in the 'token' field of the first account
     let google_account: Option<crate::browser::GoogleAccount> = config.accounts
@@ -210,6 +215,7 @@ pub async fn start_bot(state: State<'_, AppState>) -> Result<(), String> {
     let keywords = config.keywords.clone();
     let max_clicks = config.max_clicks_per_session;
     let auto_rotate_ip = config.auto_rotate_ip;
+    let captcha_api_key = config.captcha_api_key.clone();
 
     tokio::spawn(async move {
         info!("Bot loop started with {} sessions (auto_rotate_ip: {})", session_ids.len(), auto_rotate_ip);
@@ -224,9 +230,10 @@ pub async fn start_bot(state: State<'_, AppState>) -> Result<(), String> {
             let google_acc = google_account.clone();
             let running = is_running.clone();
             let kws = keywords.clone();
+            let captcha_key = captcha_api_key.clone();
 
             let handle = tokio::spawn(async move {
-                run_session_loop(session_id, pool, stats, rate_cfg, running, kws, max_clicks, google_acc, auto_rotate_ip).await;
+                run_session_loop(session_id, pool, stats, rate_cfg, running, kws, max_clicks, google_acc, auto_rotate_ip, captcha_key).await;
             });
 
             handles.push(handle);
@@ -243,6 +250,69 @@ pub async fn start_bot(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Verify a session has a unique IP (not used by any other session).
+/// If the IP is a duplicate, closes the session and spawns a new one (up to max_retries).
+/// Returns (session_id, session) on success, or None if all retries failed.
+async fn ensure_unique_ip(
+    session_id: String,
+    session: std::sync::Arc<crate::browser::BrowserSession>,
+    pool: &std::sync::Arc<crate::browser::BrowserPool>,
+    max_retries: u32,
+) -> Option<(String, std::sync::Arc<crate::browser::BrowserSession>)> {
+    let mut current_id = session_id;
+    let mut current_session = session;
+
+    for attempt in 0..=max_retries {
+        // Detect the session's IP
+        match current_session.detect_ip().await {
+            Ok(ip) => {
+                // Check if this IP is new (not used before)
+                if pool.register_ip(&ip).await {
+                    info!("Session {} verified unique IP: {}", current_id, ip);
+                    return Some((current_id, current_session));
+                }
+
+                // Duplicate IP - close and retry
+                warn!("Session {} got duplicate IP {} (attempt {}/{}), retrying with new session",
+                    current_id, ip, attempt + 1, max_retries + 1);
+
+                let _ = pool.close_session(&current_id).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+
+                // Spawn a new session
+                match pool.spawn_sessions(1).await {
+                    Ok(new_ids) if !new_ids.is_empty() => {
+                        let new_id = new_ids.into_iter().next().unwrap();
+                        match pool.get_session(&new_id).await {
+                            Some(s) => {
+                                current_id = new_id;
+                                current_session = s;
+                                continue;
+                            }
+                            None => {
+                                error!("New session {} not found after spawn", new_id);
+                                return None;
+                            }
+                        }
+                    }
+                    _ => {
+                        error!("Failed to spawn replacement session for unique IP");
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                // IP detection failed - log warning but continue (proxy is still unique by sessid)
+                warn!("Session {} IP detection failed: {} - continuing with random sessid guarantee", current_id, e);
+                return Some((current_id, current_session));
+            }
+        }
+    }
+
+    error!("Failed to get unique IP after {} retries", max_retries + 1);
+    None
+}
+
 /// Run the bot loop for a single session
 async fn run_session_loop(
     mut session_id: String,
@@ -254,6 +324,7 @@ async fn run_session_loop(
     max_clicks: u32,
     google_account: Option<crate::browser::GoogleAccount>,
     auto_rotate_ip: bool,
+    captcha_api_key: String,
 ) {
     info!("Session {} bot loop starting (max_clicks: {}, google_login: {}, auto_rotate_ip: {})",
         session_id,
@@ -262,13 +333,30 @@ async fn run_session_loop(
         auto_rotate_ip
     );
 
+    // Track active session in global stats
+    stats.add_session();
+
     let mut session = match pool.get_session(&session_id).await {
         Some(s) => s,
         None => {
             warn!("Session {} not found", session_id);
+            stats.remove_session();
             return;
         }
     };
+
+    // Verify this session has a unique IP (retry up to 3 times if duplicate)
+    match ensure_unique_ip(session_id.clone(), session, &pool, 3).await {
+        Some((verified_id, verified_session)) => {
+            session_id = verified_id;
+            session = verified_session;
+        }
+        None => {
+            error!("Session {} could not get a unique IP, stopping", session_id);
+            stats.remove_session();
+            return;
+        }
+    }
 
     // Create rate limiter for this session
     let config = rate_config.read().await.clone();
@@ -276,13 +364,12 @@ async fn run_session_loop(
 
     let mut keyword_index = 0;
     let mut session_clicks: u32 = 0;
-    let mut captcha_restarts: u32 = 0;
+    let mut consecutive_errors: u32 = 0;
     let mut already_logged_in = false; // Track Google login state across cycles
     let mut ip_rotation_count: u32 = 0; // Track IP rotations for this session
-    const MAX_CAPTCHA_RESTARTS: u32 = 5; // Max restarts due to CAPTCHA before giving up
     let keyword_count = keywords.len();
 
-    while is_running.load(Ordering::Relaxed) && session.is_alive() {
+    while is_running.load(Ordering::Relaxed) {
         // Check if we've reached the max clicks limit for this session
         if max_clicks > 0 && session_clicks >= max_clicks {
             info!("Session {} reached max clicks limit ({}), closing", session_id, max_clicks);
@@ -300,7 +387,7 @@ async fn run_session_loop(
         keyword_index += 1;
 
         // Run a cycle (with optional Google login)
-        let start = std::time::Instant::now();
+        let cycle_start = std::time::Instant::now();
         match BrowserActions::run_cycle_with_login(
             &session,
             keyword,
@@ -310,13 +397,13 @@ async fn run_session_loop(
             &mut already_logged_in,
         ).await {
             Ok(clicked) => {
-                let latency = start.elapsed().as_millis() as u64;
+                let latency = cycle_start.elapsed().as_millis() as u64;
                 if clicked {
                     stats.record_click(latency);
                     rate_limiter.record_success();
                     session_clicks += 1;
-                    // Reset error counter on success - gives fresh chances for next cycles
-                    captcha_restarts = 0;
+                    // Reset error counter on success
+                    consecutive_errors = 0;
                 }
 
                 // Check if we should auto-rotate IP after completing all keywords
@@ -326,16 +413,178 @@ async fn run_session_loop(
 
                     // Close current session
                     let _ = pool.close_session(&session_id).await;
-
-                    // Short delay before spawning new session
                     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-                    // Spawn new session with new IP
+                    // Spawn new session with new IP - retry forever
+                    loop {
+                        if !is_running.load(Ordering::Relaxed) { break; }
+                        match pool.spawn_sessions(1).await {
+                            Ok(new_ids) if !new_ids.is_empty() => {
+                                let new_id = new_ids.into_iter().next().unwrap();
+                                ip_rotation_count += 1;
+                                info!("Session {} -> {} (auto-rotate #{})", session_id, new_id, ip_rotation_count);
+                                session_id = new_id;
+
+                                match pool.get_session(&session_id).await {
+                                    Some(s) => {
+                                        session = s;
+                                        already_logged_in = false;
+                                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                                        break;
+                                    }
+                                    None => {
+                                        warn!("New session {} not found - retrying", session_id);
+                                        tokio::time::sleep(Duration::from_millis(2000)).await;
+                                    }
+                                }
+                            }
+                            _ => {
+                                warn!("Failed to spawn replacement - retrying in 3s");
+                                tokio::time::sleep(Duration::from_millis(3000)).await;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(BrowserError::CaptchaDetected(msg)) => {
+                warn!("Session {} CAPTCHA detected: {}", session_id, msg);
+
+                // Try solving with 2Captcha first (if API key configured)
+                let mut solved = false;
+                if !captcha_api_key.is_empty() {
+                    info!("Session {} attempting to solve CAPTCHA with 2Captcha...", session_id);
+                    match BrowserActions::solve_google_captcha(&session, &captcha_api_key).await {
+                        Ok(true) => {
+                            info!("Session {} CAPTCHA solved successfully! Continuing...", session_id);
+                            solved = true;
+                            consecutive_errors = 0; // Reset on successful solve
+                        }
+                        Ok(false) => {
+                            warn!("Session {} CAPTCHA solve returned false (no sitekey or submit failed)", session_id);
+                        }
+                        Err(e) => {
+                            warn!("Session {} CAPTCHA solve failed: {}", session_id, e);
+                        }
+                    }
+                } else {
+                    warn!("Session {} no 2Captcha API key configured, falling back to IP change", session_id);
+                }
+
+                if solved {
+                    // CAPTCHA was solved, continue the loop
+                    consecutive_errors = 0;
+                    continue;
+                }
+
+                // CAPTCHA not solved - fall back to IP change
+                warn!("Session {} CAPTCHA not solved - changing IP", session_id);
+                stats.record_error();
+                session.increment_errors();
+                consecutive_errors += 1;
+
+                // Backoff on many consecutive errors (but NEVER stop)
+                if consecutive_errors > 10 {
+                    let backoff = std::cmp::min(consecutive_errors as u64 * 1000, 30_000);
+                    warn!("Session {} backing off {}ms ({} consecutive errors)", session_id, backoff, consecutive_errors);
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                }
+
+                // Close current session and spawn fresh one
+                let _ = pool.close_session(&session_id).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                match pool.spawn_sessions(1).await {
+                    Ok(new_ids) if !new_ids.is_empty() => {
+                        let new_id = new_ids.into_iter().next().unwrap();
+                        info!("Session {} -> {} (IP change #{}, reason: CAPTCHA unsolved)",
+                            session_id, new_id, consecutive_errors);
+                        session_id = new_id;
+
+                        match pool.get_session(&session_id).await {
+                            Some(s) => {
+                                session = s;
+                                already_logged_in = false;
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                            None => {
+                                warn!("New session {} not found - retrying spawn", session_id);
+                                tokio::time::sleep(Duration::from_millis(2000)).await;
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        warn!("Failed to spawn replacement - retrying in 3s");
+                        tokio::time::sleep(Duration::from_millis(3000)).await;
+                        continue;
+                    }
+                }
+            }
+            Err(BrowserError::ElementNotFound(msg)) if msg.contains("need new IP") => {
+                // No ad found - FAST IP change, NEVER stop
+                warn!("Session {} no ad found: {} - FAST IP change", session_id, msg);
+                ip_rotation_count += 1;
+
+                // Close current session immediately
+                let _ = pool.close_session(&session_id).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+
+                // Spawn a new session with new IP - retry forever
+                loop {
+                    if !is_running.load(Ordering::Relaxed) { break; }
                     match pool.spawn_sessions(1).await {
                         Ok(new_ids) if !new_ids.is_empty() => {
                             let new_id = new_ids.into_iter().next().unwrap();
-                            ip_rotation_count += 1;
-                            info!("Session {} -> {} (auto-rotate #{})", session_id, new_id, ip_rotation_count);
+                            info!("Session {} -> {} (no ad, IP change #{})",
+                                session_id, new_id, ip_rotation_count);
+                            session_id = new_id;
+
+                            match pool.get_session(&session_id).await {
+                                Some(s) => {
+                                    session = s;
+                                    already_logged_in = false;
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    break;
+                                }
+                                None => {
+                                    warn!("New session {} not found - retrying", session_id);
+                                    tokio::time::sleep(Duration::from_millis(2000)).await;
+                                }
+                            }
+                        }
+                        _ => {
+                            warn!("Failed to spawn replacement - retrying in 3s");
+                            tokio::time::sleep(Duration::from_millis(3000)).await;
+                        }
+                    }
+                }
+            }
+            Err(BrowserError::Timeout(msg)) |
+            Err(BrowserError::NavigationFailed(msg)) |
+            Err(BrowserError::ConnectionLost(msg)) => {
+                // Network/timeout errors - change IP, NEVER stop
+                warn!("Session {} network error: {} - changing IP", session_id, msg);
+                stats.record_error();
+                session.increment_errors();
+                consecutive_errors += 1;
+
+                // Backoff on many consecutive errors
+                if consecutive_errors > 5 {
+                    let backoff = std::cmp::min(consecutive_errors as u64 * 1000, 30_000);
+                    warn!("Session {} network backoff {}ms ({} consecutive)", session_id, backoff, consecutive_errors);
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                }
+
+                // Close and respawn - retry forever
+                let _ = pool.close_session(&session_id).await;
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+
+                loop {
+                    if !is_running.load(Ordering::Relaxed) { break; }
+                    match pool.spawn_sessions(1).await {
+                        Ok(new_ids) if !new_ids.is_empty() => {
+                            let new_id = new_ids.into_iter().next().unwrap();
+                            info!("Session {} -> {} (network error: {})", session_id, new_id, msg);
                             session_id = new_id;
 
                             match pool.get_session(&session_id).await {
@@ -343,177 +592,59 @@ async fn run_session_loop(
                                     session = s;
                                     already_logged_in = false;
                                     tokio::time::sleep(Duration::from_millis(1000)).await;
-                                }
-                                None => {
-                                    error!("New session {} not found - stopping", session_id);
                                     break;
                                 }
+                                None => {
+                                    warn!("New session {} not found - retrying", session_id);
+                                    tokio::time::sleep(Duration::from_millis(2000)).await;
+                                }
                             }
                         }
-                        Ok(_) | Err(_) => {
-                            error!("Failed to spawn replacement - stopping");
-                            break;
+                        _ => {
+                            warn!("Failed to spawn replacement - retrying in 3s");
+                            tokio::time::sleep(Duration::from_millis(3000)).await;
                         }
-                    }
-                }
-            }
-            Err(BrowserError::CaptchaDetected(msg)) => {
-                // IMMEDIATE IP CHANGE - no delay, fast restart
-                warn!("Session {} BLOCKED: {} - IMMEDIATE IP change", session_id, msg);
-                stats.record_error();
-                session.increment_errors();
-
-                // Check if we've exceeded max restarts (prevent infinite loop)
-                captcha_restarts += 1;
-                if captcha_restarts >= MAX_CAPTCHA_RESTARTS {
-                    error!("Session {} exceeded max restarts ({}), stopping this session", session_id, MAX_CAPTCHA_RESTARTS);
-                    break;
-                }
-
-                // Close current session IMMEDIATELY
-                let _ = pool.close_session(&session_id).await;
-
-                // Minimal delay - just enough for cleanup (500ms instead of 2000ms)
-                tokio::time::sleep(Duration::from_millis(500)).await;
-
-                // Spawn new session with new IP
-                match pool.spawn_sessions(1).await {
-                    Ok(new_ids) if !new_ids.is_empty() => {
-                        let new_id = new_ids.into_iter().next().unwrap();
-                        info!("Session {} -> {} (IP change #{}, reason: {})",
-                            session_id, new_id, captcha_restarts, msg);
-                        session_id = new_id;
-
-                        match pool.get_session(&session_id).await {
-                            Some(s) => {
-                                session = s;
-                                already_logged_in = false; // Reset login state
-                                // Short delay before continuing (1s instead of 3s)
-                                tokio::time::sleep(Duration::from_millis(1000)).await;
-                            }
-                            None => {
-                                error!("New session {} not found - stopping", session_id);
-                                break;
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        error!("Failed to spawn replacement session - stopping");
-                        break;
-                    }
-                    Err(e) => {
-                        error!("Error spawning replacement: {} - stopping", e);
-                        break;
-                    }
-                }
-            }
-            Err(BrowserError::ElementNotFound(msg)) if msg.contains("need new IP") => {
-                // No ad found - change IP and retry
-                warn!("Session {} no ad found: {} - changing IP", session_id, msg);
-
-                // Record as failed attempt (for accurate success rate)
-                stats.record_error();
-                session.increment_errors();
-
-                // Track consecutive "no ad" errors to prevent infinite loop
-                captcha_restarts += 1;
-                if captcha_restarts >= MAX_CAPTCHA_RESTARTS {
-                    error!("Session {} exceeded max 'no ad found' restarts ({}), stopping", session_id, MAX_CAPTCHA_RESTARTS);
-                    break;
-                }
-
-                // Close current session
-                if let Err(e) = pool.close_session(&session_id).await {
-                    warn!("Failed to close session {}: {}", session_id, e);
-                }
-
-                // Short delay before spawning new session (1-2s)
-                tokio::time::sleep(Duration::from_millis(1000 + rand::random::<u64>() % 1000)).await;
-
-                // Spawn a new session with new IP
-                match pool.spawn_sessions(1).await {
-                    Ok(new_ids) if !new_ids.is_empty() => {
-                        let new_id = new_ids.into_iter().next().unwrap();
-                        info!("Session {} replaced with new session {} (no ad found - new IP)",
-                            session_id, new_id);
-                        session_id = new_id;
-
-                        // Get the new session
-                        match pool.get_session(&session_id).await {
-                            Some(s) => {
-                                session = s;
-                                already_logged_in = false; // Reset login state for new session
-                                // Short wait before continuing (1s instead of 2-4s)
-                                tokio::time::sleep(Duration::from_millis(1000)).await;
-                            }
-                            None => {
-                                warn!("New session {} not found after spawn", session_id);
-                                break;
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        warn!("Failed to spawn replacement session");
-                        break;
-                    }
-                    Err(e) => {
-                        warn!("Error spawning replacement session: {}", e);
-                        break;
-                    }
-                }
-            }
-            Err(BrowserError::Timeout(msg)) |
-            Err(BrowserError::NavigationFailed(msg)) |
-            Err(BrowserError::ConnectionLost(msg)) => {
-                // Network/timeout errors - change IP immediately
-                warn!("Session {} network error: {} - changing IP", session_id, msg);
-                stats.record_error();
-                session.increment_errors();
-
-                // Track consecutive network errors to prevent infinite loop
-                captcha_restarts += 1;
-                if captcha_restarts >= MAX_CAPTCHA_RESTARTS {
-                    error!("Session {} exceeded max network error restarts ({}), stopping", session_id, MAX_CAPTCHA_RESTARTS);
-                    break;
-                }
-
-                // Close current session
-                let _ = pool.close_session(&session_id).await;
-
-                // Short delay before spawning new session (1s)
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-
-                // Spawn new session with new IP
-                match pool.spawn_sessions(1).await {
-                    Ok(new_ids) if !new_ids.is_empty() => {
-                        let new_id = new_ids.into_iter().next().unwrap();
-                        info!("Session {} -> {} (network error: {})", session_id, new_id, msg);
-                        session_id = new_id;
-
-                        match pool.get_session(&session_id).await {
-                            Some(s) => {
-                                session = s;
-                                already_logged_in = false;
-                                tokio::time::sleep(Duration::from_millis(1000)).await;
-                            }
-                            None => {
-                                error!("New session {} not found - stopping", session_id);
-                                break;
-                            }
-                        }
-                    }
-                    Ok(_) | Err(_) => {
-                        error!("Failed to spawn replacement after network error - stopping");
-                        break;
                     }
                 }
             }
             Err(e) => {
-                // Other errors - just log and continue (don't change IP)
+                // Other errors - log and keep going (NEVER stop)
                 warn!("Session {} cycle error: {}", session_id, e);
                 stats.record_error();
                 rate_limiter.record_error();
                 session.increment_errors();
+                consecutive_errors += 1;
+
+                // If session died, respawn it
+                if !session.is_alive() {
+                    warn!("Session {} died - respawning", session_id);
+                    let _ = pool.close_session(&session_id).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+
+                    loop {
+                        if !is_running.load(Ordering::Relaxed) { break; }
+                        match pool.spawn_sessions(1).await {
+                            Ok(new_ids) if !new_ids.is_empty() => {
+                                let new_id = new_ids.into_iter().next().unwrap();
+                                info!("Session {} -> {} (respawned after error)", session_id, new_id);
+                                session_id = new_id;
+                                match pool.get_session(&session_id).await {
+                                    Some(s) => {
+                                        session = s;
+                                        already_logged_in = false;
+                                        break;
+                                    }
+                                    None => {
+                                        tokio::time::sleep(Duration::from_millis(2000)).await;
+                                    }
+                                }
+                            }
+                            _ => {
+                                tokio::time::sleep(Duration::from_millis(3000)).await;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -523,7 +654,10 @@ async fn run_session_loop(
         warn!("Failed to close session {}: {}", session_id, e);
     }
 
-    info!("Session {} bot loop ended (clicks: {}, captcha_restarts: {})", session_id, session_clicks, captcha_restarts);
+    // Track session removal in global stats
+    stats.remove_session();
+
+    info!("Session {} bot loop ended (clicks: {}, ip_rotations: {}, errors: {})", session_id, session_clicks, ip_rotation_count, consecutive_errors);
 }
 
 /// Stop the bot
@@ -534,6 +668,9 @@ pub async fn stop_bot(state: State<'_, AppState>) -> Result<(), String> {
 
     // Close all sessions
     state.browser_pool.close_all().await.map_err(|e| e.to_string())?;
+
+    // Reset active session counter (all loops will exit)
+    state.global_stats.set_active_sessions(0);
 
     Ok(())
 }

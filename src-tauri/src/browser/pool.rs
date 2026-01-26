@@ -3,7 +3,7 @@
 //! Manages multiple browser instances running in parallel with unique proxies.
 
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
 use tracing::{info, warn, error};
 use uuid::Uuid;
@@ -48,6 +48,8 @@ pub struct BrowserPool {
     default_config: BrowserSessionConfig,
     /// Session statuses
     statuses: Arc<RwLock<HashMap<String, SessionStatus>>>,
+    /// Track all IPs used in this run to prevent duplicates
+    used_ips: Arc<RwLock<HashSet<String>>>,
 }
 
 impl BrowserPool {
@@ -58,6 +60,7 @@ impl BrowserPool {
             proxy_manager,
             default_config: BrowserSessionConfig::default(),
             statuses: Arc::new(RwLock::new(HashMap::new())),
+            used_ips: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -72,16 +75,17 @@ impl BrowserPool {
         self.spawn_sessions_with_options(count, None).await
     }
 
-    /// Spawn multiple browser sessions with staggered starts
+    /// Spawn multiple browser sessions in TRUE PARALLEL
     ///
     /// Each session gets a unique proxy URL to ensure different IPs.
-    /// Sessions are spawned with a delay between them to avoid resource conflicts.
+    /// All sessions launch simultaneously for maximum speed.
     /// Optionally override headless mode.
     pub async fn spawn_sessions_with_options(&self, count: usize, headless: Option<bool>) -> Result<Vec<String>, BrowserError> {
         use std::time::Duration;
+        use futures::future::join_all;
 
         let headless_mode = headless.unwrap_or(self.default_config.headless);
-        info!("=== SPAWNING {} BROWSER SESSIONS (headless: {}) ===", count, headless_mode);
+        info!("=== SPAWNING {} BROWSER SESSIONS IN PARALLEL (headless: {}) ===", count, headless_mode);
 
         // Get unique proxies for each session
         let proxies = if self.proxy_manager.is_enabled() {
@@ -92,42 +96,50 @@ impl BrowserPool {
             None
         };
 
-        let mut session_ids = Vec::with_capacity(count);
-
-        // Spawn sessions sequentially with staggered delays to avoid Chrome conflicts
-        // This is more reliable than parallel spawning which can cause port/resource conflicts
-        for i in 0..count {
-            info!(">>> Starting session {}/{}", i + 1, count);
-
-            let proxy = proxies.as_ref().map(|p| p[i].clone());
-            if let Some(ref p) = proxy {
-                info!("  Session {} will use proxy: {}", i + 1, p.split('@').last().unwrap_or("unknown"));
+        // Set all statuses to starting
+        {
+            let mut s = self.statuses.write().await;
+            for i in 0..count {
+                s.insert(format!("pending_{}", i), SessionStatus::Starting);
             }
+        }
 
-            // Use unique random ID for each session to ensure fresh browser profile
+        // Prepare all session configs
+        let mut spawn_tasks = Vec::with_capacity(count);
+        for i in 0..count {
+            let proxy = proxies.as_ref().map(|p| p[i].clone());
             let unique_id = format!("{}_{}", Uuid::new_v4().to_string()[..8].to_string(), i);
             let config = BrowserSessionConfig::for_session(&unique_id)
                 .headless(headless_mode)
-                .proxy(proxy)
+                .proxy(proxy.clone())
                 .chrome_path(self.default_config.chrome_path.clone())
                 .timeout(self.default_config.timeout_secs);
 
-            // Set status to starting
-            {
-                let mut s = self.statuses.write().await;
-                s.insert(format!("pending_{}", i), SessionStatus::Starting);
+            if let Some(ref p) = proxy {
+                info!("Session {} will use proxy: {}", i + 1, p.split('@').last().unwrap_or("unknown"));
             }
 
-            // Launch browser with timeout
-            let launch_result = tokio::time::timeout(
-                Duration::from_secs(60), // 60 second timeout for browser launch
-                BrowserSession::new(config)
-            ).await;
+            // Spawn each session launch as a concurrent task
+            spawn_tasks.push(tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(45), // Reduced timeout for faster failure detection
+                    BrowserSession::new(config)
+                ).await;
+                (i, result)
+            }));
+        }
 
-            match launch_result {
-                Ok(Ok(session)) => {
+        info!("All {} session launches started simultaneously, waiting for completion...", count);
+
+        // Wait for all sessions to complete in parallel
+        let results = join_all(spawn_tasks).await;
+        let mut session_ids = Vec::with_capacity(count);
+
+        for result in results {
+            match result {
+                Ok((i, Ok(Ok(session)))) => {
                     let session_id = session.id.clone();
-                    info!("<<< Session {}/{} created: {} (IP detection pending)", i + 1, count, session_id);
+                    info!("<<< Session {}/{} created: {}", i + 1, count, session_id);
                     let session = Arc::new(session);
 
                     // Store session
@@ -145,36 +157,28 @@ impl BrowserPool {
 
                     session_ids.push(session_id);
                 }
-                Ok(Err(e)) => {
+                Ok((i, Ok(Err(e)))) => {
                     error!("!!! Session {}/{} FAILED: {}", i + 1, count, e);
-                    {
-                        let mut s = self.statuses.write().await;
-                        s.remove(&format!("pending_{}", i));
-                        s.insert(format!("failed_{}", i), SessionStatus::Error(e.to_string()));
-                    }
+                    let mut s = self.statuses.write().await;
+                    s.remove(&format!("pending_{}", i));
+                    s.insert(format!("failed_{}", i), SessionStatus::Error(e.to_string()));
                 }
-                Err(_) => {
-                    error!("!!! Session {}/{} TIMED OUT (60s)", i + 1, count);
-                    {
-                        let mut s = self.statuses.write().await;
-                        s.remove(&format!("pending_{}", i));
-                        s.insert(format!("failed_{}", i), SessionStatus::Error("Browser launch timed out".to_string()));
-                    }
+                Ok((i, Err(_))) => {
+                    error!("!!! Session {}/{} TIMED OUT (45s)", i + 1, count);
+                    let mut s = self.statuses.write().await;
+                    s.remove(&format!("pending_{}", i));
+                    s.insert(format!("failed_{}", i), SessionStatus::Error("Browser launch timed out".to_string()));
                 }
-            }
-
-            // Add delay between session spawns (except for last one)
-            // This prevents Chrome instances from conflicting with each other
-            if i < count - 1 {
-                info!("  Waiting 2s before spawning next session...");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                Err(e) => {
+                    error!("!!! Session task panicked: {}", e);
+                }
             }
         }
 
-        info!("=== SUCCESSFULLY SPAWNED {}/{} SESSIONS ===", session_ids.len(), count);
+        info!("=== {} of {} sessions launched successfully ===", session_ids.len(), count);
 
         if session_ids.is_empty() && count > 0 {
-            return Err(BrowserError::LaunchFailed("All session launches failed".to_string()));
+            return Err(BrowserError::PoolError("All session launches failed".into()));
         }
 
         Ok(session_ids)
@@ -259,11 +263,32 @@ impl BrowserPool {
             }
         }
 
-        // Clear statuses
+        // Clear statuses and used IPs
         self.statuses.write().await.clear();
+        self.used_ips.write().await.clear();
 
-        info!("All browser sessions closed");
+        info!("All browser sessions closed (used IPs cleared)");
         Ok(())
+    }
+
+    /// Register an IP as used. Returns true if the IP is new (not seen before).
+    pub async fn register_ip(&self, ip: &str) -> bool {
+        let mut used = self.used_ips.write().await;
+        let is_new = used.insert(ip.to_string());
+        if !is_new {
+            warn!("DUPLICATE IP detected: {} (already used by another session)", ip);
+        }
+        is_new
+    }
+
+    /// Check if an IP has been used before
+    pub async fn is_ip_used(&self, ip: &str) -> bool {
+        self.used_ips.read().await.contains(ip)
+    }
+
+    /// Get count of unique IPs used
+    pub async fn used_ip_count(&self) -> usize {
+        self.used_ips.read().await.len()
     }
 
     /// Detect IP for all sessions

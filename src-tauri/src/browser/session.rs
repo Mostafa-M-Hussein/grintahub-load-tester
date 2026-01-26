@@ -68,6 +68,36 @@ fn get_random_user_agent() -> &'static str {
     USER_AGENTS[idx]
 }
 
+/// Extract the major Chrome version from a user-agent string
+/// e.g., "...Chrome/131.0.0.0..." → "131"
+fn extract_chrome_version(ua: &str) -> &str {
+    if let Some(pos) = ua.find("Chrome/") {
+        let after = &ua[pos + 7..];
+        if let Some(dot_pos) = after.find('.') {
+            return &after[..dot_pos];
+        }
+    }
+    "131" // fallback
+}
+
+/// Extract the platform from a user-agent string
+fn extract_platform(ua: &str) -> &str {
+    if ua.contains("Windows") {
+        "Windows"
+    } else if ua.contains("Macintosh") {
+        "macOS"
+    } else if ua.contains("Linux") {
+        "Linux"
+    } else {
+        "Windows"
+    }
+}
+
+/// Check if the user-agent is Edge
+fn is_edge_ua(ua: &str) -> bool {
+    ua.contains("Edg/")
+}
+
 /// Configuration for a browser session
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -389,6 +419,15 @@ impl BrowserSession {
 
         // Inject anti-detection JavaScript
         Self::inject_anti_detection(&page).await?;
+
+        // Inject session-specific evasions (userAgentData, platform) matching the actual User-Agent
+        Self::inject_session_specific_evasions(&page, user_agent).await?;
+
+        // Set consistent HTTP headers via CDP (Sec-CH-UA, Accept-Language for Saudi Arabia)
+        Self::set_cdp_headers(&page, user_agent).await?;
+
+        // Block unnecessary resources to reduce proxy bandwidth consumption
+        Self::block_unnecessary_resources(&page).await?;
 
         info!("Browser session {} created successfully", session_id);
 
@@ -791,8 +830,8 @@ impl BrowserSession {
             Object.defineProperty(navigator, 'languages', { get: () => Object.freeze(['ar-SA', 'ar', 'en-US', 'en']) });
             Object.defineProperty(navigator, 'language', { get: () => 'ar-SA' });
 
-            // 5. Mock platform and userAgent properties
-            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+            // 5. Mock platform and userAgent properties (configurable for session-specific override)
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true });
             Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
             Object.defineProperty(navigator, 'productSub', { get: () => '20030107' });
 
@@ -1175,6 +1214,7 @@ impl BrowserSession {
             // 31. User-Agent Client Hints API (modern detection method)
             if (navigator.userAgentData) {
                 Object.defineProperty(navigator, 'userAgentData', {
+                    configurable: true,
                     get: () => ({
                         brands: [
                             { brand: 'Google Chrome', version: '131' },
@@ -1380,6 +1420,186 @@ impl BrowserSession {
         .map_err(|e| BrowserError::JavaScriptError(e.to_string()))?;
 
         debug!("Stealth anti-detection scripts injected");
+        Ok(())
+    }
+
+    /// Inject session-specific evasions that match the actual User-Agent
+    /// Overrides navigator.userAgentData, platform, etc. to be consistent
+    async fn inject_session_specific_evasions(page: &Page, user_agent: &str) -> Result<(), BrowserError> {
+        let chrome_version = extract_chrome_version(user_agent);
+        let is_edge = is_edge_ua(user_agent);
+        let platform = extract_platform(user_agent);
+
+        // Determine navigator.platform value
+        let nav_platform = match platform {
+            "Windows" => "Win32",
+            "macOS" => "MacIntel",
+            "Linux" => "Linux x86_64",
+            _ => "Win32",
+        };
+
+        // Build browser brand name
+        let browser_brand = if is_edge { "Microsoft Edge" } else { "Google Chrome" };
+
+        // Full version string
+        let full_version = format!("{}.0.0.0", chrome_version);
+
+        let script = format!(r#"
+            // === SESSION-SPECIFIC EVASIONS (matching User-Agent) ===
+
+            // Override navigator.userAgentData to match selected UA
+            if (navigator.userAgentData || true) {{
+                Object.defineProperty(navigator, 'userAgentData', {{
+                    get: () => ({{
+                        brands: [
+                            {{ brand: '{browser_brand}', version: '{chrome_version}' }},
+                            {{ brand: 'Chromium', version: '{chrome_version}' }},
+                            {{ brand: 'Not_A Brand', version: '24' }}
+                        ],
+                        mobile: false,
+                        platform: '{platform}',
+                        getHighEntropyValues: (hints) => Promise.resolve({{
+                            architecture: 'x86',
+                            bitness: '64',
+                            brands: [
+                                {{ brand: '{browser_brand}', version: '{chrome_version}' }},
+                                {{ brand: 'Chromium', version: '{chrome_version}' }},
+                                {{ brand: 'Not_A Brand', version: '24' }}
+                            ],
+                            fullVersionList: [
+                                {{ brand: '{browser_brand}', version: '{full_version}' }},
+                                {{ brand: 'Chromium', version: '{full_version}' }},
+                                {{ brand: 'Not_A Brand', version: '24.0.0.0' }}
+                            ],
+                            mobile: false,
+                            model: '',
+                            platform: '{platform}',
+                            platformVersion: '15.0.0',
+                            uaFullVersion: '{full_version}'
+                        }}),
+                        toJSON: () => ({{
+                            brands: [
+                                {{ brand: '{browser_brand}', version: '{chrome_version}' }},
+                                {{ brand: 'Chromium', version: '{chrome_version}' }},
+                                {{ brand: 'Not_A Brand', version: '24' }}
+                            ],
+                            mobile: false,
+                            platform: '{platform}'
+                        }})
+                    }}),
+                    configurable: true
+                }});
+            }}
+
+            // Override navigator.platform to match UA
+            Object.defineProperty(navigator, 'platform', {{ get: () => '{nav_platform}', configurable: true }});
+
+            console.log('[Stealth] Session-specific evasions applied - {browser_brand}/{chrome_version} on {platform}');
+        "#,
+            browser_brand = browser_brand,
+            chrome_version = chrome_version,
+            full_version = full_version,
+            platform = platform,
+            nav_platform = nav_platform,
+        );
+
+        page.evaluate(script)
+            .await
+            .map_err(|e| BrowserError::JavaScriptError(format!("Session evasion injection failed: {}", e)))?;
+
+        debug!("Session-specific evasions injected: {}/{} on {}", browser_brand, chrome_version, platform);
+        Ok(())
+    }
+
+    /// Set consistent HTTP headers via CDP to match the selected User-Agent and Saudi Arabia region
+    async fn set_cdp_headers(page: &Page, user_agent: &str) -> Result<(), BrowserError> {
+        use chromiumoxide::cdp::browser_protocol::network::{
+            EnableParams, SetExtraHttpHeadersParams, Headers,
+        };
+
+        // Enable Network domain (required before setting headers)
+        page.execute(EnableParams::default())
+            .await
+            .map_err(|e| BrowserError::JavaScriptError(format!("Failed to enable Network domain: {}", e)))?;
+
+        let chrome_version = extract_chrome_version(user_agent);
+        let platform = extract_platform(user_agent);
+
+        // Build Sec-CH-UA header consistent with the selected User-Agent
+        let sec_ch_ua = if is_edge_ua(user_agent) {
+            format!("\"Microsoft Edge\";v=\"{}\", \"Chromium\";v=\"{}\", \"Not_A Brand\";v=\"24\"", chrome_version, chrome_version)
+        } else {
+            format!("\"Google Chrome\";v=\"{}\", \"Chromium\";v=\"{}\", \"Not_A Brand\";v=\"24\"", chrome_version, chrome_version)
+        };
+
+        // Build headers JSON map - Saudi Arabia region headers
+        let headers_json = serde_json::json!({
+            "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Sec-CH-UA": sec_ch_ua,
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": format!("\"{}\"", platform),
+        });
+
+        let params = SetExtraHttpHeadersParams::new(Headers::new(headers_json));
+        page.execute(params)
+            .await
+            .map_err(|e| BrowserError::JavaScriptError(format!("Failed to set CDP headers: {}", e)))?;
+
+        info!("CDP headers set - Sec-CH-UA: {}/{}, Platform: {}, Accept-Language: ar-SA",
+              if is_edge_ua(user_agent) { "Edge" } else { "Chrome" }, chrome_version, platform);
+        Ok(())
+    }
+
+    /// Block unnecessary resources via CDP to reduce proxy bandwidth consumption
+    ///
+    /// This significantly reduces proxy data usage by blocking:
+    /// - Analytics/tracking scripts (not needed for ad clicking)
+    /// - Third-party tracking pixels
+    /// - Font downloads (system fonts used instead)
+    /// - Video embeds
+    ///
+    /// NOTE: Google Ads services are NOT blocked (googleadservices.com, googlesyndication.com)
+    async fn block_unnecessary_resources(page: &Page) -> Result<(), BrowserError> {
+        use chromiumoxide::cdp::browser_protocol::network::SetBlockedUrLsParams;
+
+        let blocked_urls = vec![
+            // Analytics & tracking (NOT related to Google Ads)
+            "*.google-analytics.com/*".to_string(),
+            "*collect?v=*".to_string(),                    // GA collect endpoint pattern
+            "*.facebook.net/*".to_string(),
+            "*.hotjar.com/*".to_string(),
+            "*.hotjar.io/*".to_string(),
+            "*.segment.io/*".to_string(),
+            "*.segment.com/*".to_string(),
+            "*.mixpanel.com/*".to_string(),
+            "*.amplitude.com/*".to_string(),
+            "*.clarity.ms/*".to_string(),
+            "*.newrelic.com/*".to_string(),
+            "*.sentry.io/*".to_string(),
+            "*.mouseflow.com/*".to_string(),
+            "*.crazyegg.com/*".to_string(),
+            "*.fullstory.com/*".to_string(),
+            "*.heap-analytics.com/*".to_string(),
+            // Social media widgets & tracking
+            "platform.twitter.com/*".to_string(),
+            "connect.facebook.net/*".to_string(),
+            "*.linkedin.com/li.lms-analytics/*".to_string(),
+            // Video embeds (heavy bandwidth)
+            "*.youtube.com/embed/*".to_string(),
+            "*.vimeo.com/*".to_string(),
+            // Font services (saves ~200-500KB per page load)
+            "fonts.googleapis.com/*".to_string(),
+            "fonts.gstatic.com/*".to_string(),
+            "use.typekit.net/*".to_string(),
+            "*.fontawesome.com/*".to_string(),
+        ];
+
+        let params = SetBlockedUrLsParams::new(blocked_urls);
+        page.execute(params)
+            .await
+            .map_err(|e| BrowserError::JavaScriptError(format!("Failed to block URLs: {}", e)))?;
+
+        info!("Resource blocking enabled - analytics, tracking, fonts, video blocked (saves proxy bandwidth)");
         Ok(())
     }
 }

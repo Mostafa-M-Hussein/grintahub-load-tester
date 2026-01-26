@@ -95,6 +95,345 @@ impl BrowserActions {
         Ok(is_blocked)
     }
 
+    /// Try to solve a Google CAPTCHA using 2Captcha service
+    /// Returns Ok(true) if solved, Ok(false) if solving failed
+    pub async fn solve_google_captcha(
+        session: &Arc<BrowserSession>,
+        captcha_api_key: &str,
+    ) -> Result<bool, BrowserError> {
+        if captcha_api_key.is_empty() {
+            warn!("Session {} no 2Captcha API key, cannot solve CAPTCHA", session.id);
+            return Ok(false);
+        }
+
+        info!("Session {} solving Google CAPTCHA with 2Captcha...", session.id);
+
+        // 1. Extract page info and reCAPTCHA sitekey
+        let captcha_info = session.execute_js(r#"
+            (function() {
+                const url = window.location.href;
+                const isGoogleSorry = url.includes('/sorry/') || url.includes('google.com/sorry');
+                const bodyText = document.body ? document.body.innerText : '';
+                let sitekey = null;
+                let method = 'none';
+
+                // Method 1: data-sitekey attribute (most common)
+                const recaptchaDiv = document.querySelector('[data-sitekey]');
+                if (recaptchaDiv) {
+                    sitekey = recaptchaDiv.getAttribute('data-sitekey');
+                    method = 'data-sitekey';
+                }
+
+                // Method 2: reCAPTCHA iframe src parameter k=
+                if (!sitekey) {
+                    const iframe = document.querySelector('iframe[src*="recaptcha"]');
+                    if (iframe) {
+                        const match = iframe.src.match(/[?&]k=([^&]+)/);
+                        if (match) {
+                            sitekey = match[1];
+                            method = 'iframe-k-param';
+                        }
+                    }
+                }
+
+                // Method 3: reCAPTCHA anchor iframe
+                if (!sitekey) {
+                    const anchor = document.querySelector('iframe[src*="anchor"]');
+                    if (anchor) {
+                        const match = anchor.src.match(/[?&]k=([^&]+)/);
+                        if (match) {
+                            sitekey = match[1];
+                            method = 'anchor-iframe';
+                        }
+                    }
+                }
+
+                // Method 4: Script tags with sitekey reference
+                if (!sitekey) {
+                    const scripts = document.querySelectorAll('script');
+                    for (const script of scripts) {
+                        const text = script.textContent || '';
+                        const m = text.match(/['"]sitekey['"]\s*:\s*['"]([A-Za-z0-9_-]{30,60})['"]/);
+                        if (m) { sitekey = m[1]; method = 'script-sitekey'; break; }
+                        const m2 = text.match(/grecaptcha\.render\([^,]+,\s*\{[^}]*['"]sitekey['"]\s*:\s*['"]([^'"]+)['"]/);
+                        if (m2) { sitekey = m2[1]; method = 'script-render'; break; }
+                    }
+                }
+
+                // Method 5: Script src with render= parameter
+                if (!sitekey) {
+                    const apiScript = document.querySelector('script[src*="recaptcha/api.js"], script[src*="recaptcha/enterprise.js"]');
+                    if (apiScript) {
+                        const match = apiScript.src.match(/[?&]render=([^&]+)/);
+                        if (match && match[1] !== 'explicit') {
+                            sitekey = match[1];
+                            method = 'api-render-param';
+                        }
+                    }
+                }
+
+                // Method 6: ___grecaptcha_cfg global
+                if (!sitekey && typeof ___grecaptcha_cfg !== 'undefined') {
+                    try {
+                        const clients = ___grecaptcha_cfg.clients;
+                        for (const key in clients) {
+                            const c = clients[key];
+                            if (c && c.rr) {
+                                for (const rkey in c.rr) {
+                                    const rr = c.rr[rkey];
+                                    if (rr && rr.sitekey) {
+                                        sitekey = rr.sitekey;
+                                        method = 'grecaptcha-cfg';
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } catch(e) {}
+                }
+
+                // Detect callback function name
+                let callbackName = null;
+                if (recaptchaDiv) {
+                    callbackName = recaptchaDiv.getAttribute('data-callback');
+                }
+
+                // Detect if reCAPTCHA Enterprise (Google /sorry/ pages use Enterprise)
+                let isEnterprise = false;
+                const iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
+                for (const iframe of iframes) {
+                    if (iframe.src.includes('/enterprise/')) {
+                        isEnterprise = true;
+                        break;
+                    }
+                }
+                // Also check script tags for enterprise API
+                if (!isEnterprise) {
+                    const scripts = document.querySelectorAll('script[src*="recaptcha/enterprise"]');
+                    if (scripts.length > 0) isEnterprise = true;
+                }
+
+                // Check for the number of forms and buttons
+                const forms = document.querySelectorAll('form');
+                const submitBtns = document.querySelectorAll('input[type="submit"], button[type="submit"]');
+
+                return {
+                    url: url,
+                    sitekey: sitekey,
+                    method: method,
+                    isGoogleSorry: isGoogleSorry,
+                    isEnterprise: isEnterprise,
+                    callbackName: callbackName,
+                    formCount: forms.length,
+                    submitCount: submitBtns.length,
+                    hasRecaptchaResponse: !!document.querySelector('#g-recaptcha-response, textarea[name="g-recaptcha-response"]'),
+                    bodyPreview: bodyText.substring(0, 200)
+                };
+            })()
+        "#).await?;
+
+        let page_url = captcha_info.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let method = captcha_info.get("method").and_then(|v| v.as_str()).unwrap_or("none");
+        let is_google_sorry = captcha_info.get("isGoogleSorry").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_enterprise = captcha_info.get("isEnterprise").and_then(|v| v.as_bool()).unwrap_or(false);
+        let callback_name = captcha_info.get("callbackName").and_then(|v| v.as_str());
+        let form_count = captcha_info.get("formCount").and_then(|v| v.as_u64()).unwrap_or(0);
+        let body_preview = captcha_info.get("bodyPreview").and_then(|v| v.as_str()).unwrap_or("");
+
+        info!("Session {} CAPTCHA page: google_sorry={}, enterprise={}, method={}, forms={}, callback={:?}, url={}",
+            session.id, is_google_sorry, is_enterprise, method, form_count, callback_name, &page_url[..page_url.len().min(80)]);
+        debug!("Session {} page body: {}", session.id, body_preview);
+
+        let sitekey = match captcha_info.get("sitekey").and_then(|v| v.as_str()) {
+            Some(key) if !key.is_empty() => key.to_string(),
+            _ => {
+                warn!("Session {} could not find sitekey (method: {})", session.id, method);
+                return Ok(false);
+            }
+        };
+
+        info!("Session {} found sitekey: {} (via {})", session.id, &sitekey[..sitekey.len().min(20)], method);
+
+        // 2. Create solver and solve reCAPTCHA v2
+        let solver = match crate::captcha::CaptchaSolver::new(captcha_api_key) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Session {} failed to create solver: {}", session.id, e);
+                return Ok(false);
+            }
+        };
+
+        // Use Enterprise variant for Google sorry pages (they use reCAPTCHA Enterprise)
+        let request = if is_enterprise || is_google_sorry {
+            info!("Session {} using reCAPTCHA Enterprise solver", session.id);
+            crate::captcha::CaptchaRequest::recaptcha_v2_enterprise(&sitekey, &page_url)
+        } else {
+            crate::captcha::CaptchaRequest::recaptcha_v2(&sitekey, &page_url)
+        };
+
+        let result = match solver.solve(&request).await {
+            Ok(r) => {
+                info!("Session {} CAPTCHA solved in {}ms! Injecting token...", session.id, r.solve_time_ms);
+                r
+            }
+            Err(e) => {
+                warn!("Session {} 2Captcha solve failed: {}", session.id, e);
+                return Ok(false);
+            }
+        };
+
+        // 3. Inject token and submit the form
+        let token = result.token.replace('\'', "\\'").replace('\n', "\\n");
+        let callback_js = if let Some(cb) = callback_name {
+            format!(
+                "if (typeof {} === 'function') {{ try {{ {}('{}'); }} catch(e) {{}} }}",
+                cb, cb, token
+            )
+        } else {
+            String::new()
+        };
+
+        let inject_script = format!(r#"
+            (function() {{
+                const token = '{}';
+                let injected = false;
+                let submitted = false;
+
+                // Step 1: Inject token into ALL g-recaptcha-response textareas
+                const textareas = document.querySelectorAll('#g-recaptcha-response, textarea[name="g-recaptcha-response"]');
+                for (const ta of textareas) {{
+                    ta.style.display = 'block';
+                    ta.innerHTML = token;
+                    ta.value = token;
+                    ta.style.display = 'none';
+                    injected = true;
+                }}
+
+                // Step 2: Try data-callback function
+                {}
+
+                // Step 3: Try ___grecaptcha_cfg callback (deep search)
+                if (typeof ___grecaptcha_cfg !== 'undefined') {{
+                    try {{
+                        const clients = ___grecaptcha_cfg.clients;
+                        for (const ckey in clients) {{
+                            const client = clients[ckey];
+                            // Search nested objects for callback functions
+                            const searchObj = (obj, depth) => {{
+                                if (depth > 5 || !obj) return;
+                                for (const key in obj) {{
+                                    if (typeof obj[key] === 'function' && key.toLowerCase().includes('callback')) {{
+                                        try {{ obj[key](token); submitted = true; }} catch(e) {{}}
+                                    }} else if (typeof obj[key] === 'object' && obj[key] !== null) {{
+                                        searchObj(obj[key], depth + 1);
+                                    }}
+                                }}
+                            }};
+                            searchObj(client, 0);
+                        }}
+                    }} catch(e) {{}}
+                }}
+
+                // Step 4: Try global callback functions commonly used by Google
+                const globalCallbacks = ['onCaptchaSuccess', 'captchaCallback', 'recaptchaCallback', 'onSuccess'];
+                for (const name of globalCallbacks) {{
+                    if (typeof window[name] === 'function') {{
+                        try {{ window[name](token); submitted = true; }} catch(e) {{}}
+                    }}
+                }}
+
+                // Step 5: Submit form if not already submitted by callback
+                if (!submitted) {{
+                    // For Google sorry page: find the specific form
+                    const forms = document.querySelectorAll('form');
+                    for (const form of forms) {{
+                        // Check if this form has the captcha response
+                        const hasResponse = form.querySelector('[name="g-recaptcha-response"]') ||
+                                           form.querySelector('#g-recaptcha-response');
+                        if (hasResponse || forms.length === 1) {{
+                            // Ensure the token is in a hidden input too (some forms need this)
+                            let hiddenInput = form.querySelector('input[name="g-recaptcha-response"]');
+                            if (!hiddenInput) {{
+                                hiddenInput = document.createElement('input');
+                                hiddenInput.type = 'hidden';
+                                hiddenInput.name = 'g-recaptcha-response';
+                                hiddenInput.value = token;
+                                form.appendChild(hiddenInput);
+                            }} else {{
+                                hiddenInput.value = token;
+                            }}
+
+                            setTimeout(() => form.submit(), 300);
+                            submitted = true;
+                            break;
+                        }}
+                    }}
+                }}
+
+                // Step 6: Last resort - click submit button
+                if (!submitted) {{
+                    const btn = document.querySelector('input[type="submit"], button[type="submit"], #submit, .submit');
+                    if (btn) {{
+                        setTimeout(() => btn.click(), 300);
+                        submitted = true;
+                    }}
+                }}
+
+                return {{ injected: injected, submitted: submitted, textareaCount: textareas.length }};
+            }})()
+        "#, token, callback_js);
+
+        let inject_result = session.execute_js(&inject_script).await?;
+
+        let injected = inject_result.get("injected").and_then(|v| v.as_bool()).unwrap_or(false);
+        let submitted = inject_result.get("submitted").and_then(|v| v.as_bool()).unwrap_or(false);
+        let textarea_count = inject_result.get("textareaCount").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        info!("Session {} token injection: injected={}, submitted={}, textareas={}",
+            session.id, injected, submitted, textarea_count);
+
+        if submitted {
+            info!("Session {} CAPTCHA solved and form submitted! Waiting for redirect...", session.id);
+            // Wait for the page to redirect after form submission
+            Self::human_delay(3000, 2000).await;
+
+            // Verify we left the CAPTCHA page
+            let still_blocked = Self::check_google_captcha(session).await.unwrap_or(true);
+            if !still_blocked {
+                info!("Session {} CAPTCHA bypass SUCCESS - page loaded", session.id);
+                return Ok(true);
+            } else {
+                warn!("Session {} still blocked after CAPTCHA submission", session.id);
+                // Try one more wait - Google sometimes takes a moment
+                Self::human_delay(2000, 1000).await;
+                let still_blocked2 = Self::check_google_captcha(session).await.unwrap_or(true);
+                if !still_blocked2 {
+                    info!("Session {} CAPTCHA bypass SUCCESS (delayed)", session.id);
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+        } else if injected {
+            warn!("Session {} token injected but form not submitted - trying manual submit", session.id);
+            // Try a direct form submit as last resort
+            let _ = session.execute_js(r#"
+                const form = document.querySelector('form');
+                if (form) form.submit();
+            "#).await;
+            Self::human_delay(3000, 2000).await;
+
+            let still_blocked = Self::check_google_captcha(session).await.unwrap_or(true);
+            if !still_blocked {
+                info!("Session {} CAPTCHA resolved after manual submit", session.id);
+                return Ok(true);
+            }
+            return Ok(false);
+        } else {
+            warn!("Session {} could not inject token (no textarea found)", session.id);
+            return Ok(false);
+        }
+    }
+
     /// Check if we're already logged into Google
     /// More strict check - only return true if we can confirm actual login
     pub async fn is_google_logged_in(session: &Arc<BrowserSession>) -> Result<bool, BrowserError> {
@@ -348,8 +687,8 @@ impl BrowserActions {
         // Navigate to Google Saudi Arabia directly for better regional targeting
         session.navigate("https://www.google.com.sa/").await?;
 
-        // Wait for page to load - longer wait for proxy latency
-        Self::human_delay(3500, 2000).await;
+        // Wait for page to load
+        Self::human_delay(1500, 500).await;
 
         // Handle any consent dialogs or interstitials (common in Middle East/EU)
         let handled_consent = session.execute_js(r#"
@@ -417,18 +756,14 @@ impl BrowserActions {
 
         info!("Session {} consent handling result: {:?}", session.id, handled_consent);
 
-        // Wait after handling consent
-        Self::human_delay(1500, 1000).await;
+        // Brief wait after handling consent
+        Self::human_delay(300, 200).await;
 
         // Check for CAPTCHA
         if Self::check_google_captcha(session).await? {
             session.increment_captchas();
             return Err(BrowserError::CaptchaDetected("CAPTCHA on Google homepage".into()));
         }
-
-        // Simulate looking at the page first
-        Self::simulate_human_mouse(session).await?;
-        Self::human_delay(500, 500).await;
 
         // Verify we can see the search input - if not, try refreshing or waiting
         let has_search = session.execute_js(r#"
@@ -440,7 +775,7 @@ impl BrowserActions {
 
         if has_search.as_bool() != Some(true) {
             warn!("Session {} search input not found, waiting longer...", session.id);
-            Self::human_delay(2000, 1000).await;
+            Self::human_delay(1500, 500).await;
 
             // Try clicking anywhere to dismiss any overlays
             session.execute_js(r#"
@@ -448,31 +783,9 @@ impl BrowserActions {
                 document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
             "#).await?;
 
-            Self::human_delay(500, 500).await;
+            Self::human_delay(200, 200).await;
         }
 
-        // Human-like: look around the page
-        session.execute_js(r#"
-            (async function() {
-                // Random small movements
-                for (let i = 0; i < 2; i++) {
-                    await new Promise(r => setTimeout(r, 200 + Math.random() * 400));
-                    const x = window.innerWidth / 2 + (Math.random() * 200 - 100);
-                    const y = window.innerHeight / 2 + (Math.random() * 150 - 75);
-                    document.dispatchEvent(new MouseEvent('mousemove', {
-                        clientX: x, clientY: y, bubbles: true
-                    }));
-                }
-
-                // Maybe small scroll
-                if (Math.random() > 0.5) {
-                    const scrollAmount = Math.floor(Math.random() * 50);
-                    window.scrollTo({ top: scrollAmount, behavior: 'smooth' });
-                }
-            })()
-        "#).await?;
-
-        Self::human_delay(400, 800).await;
         Ok(())
     }
 
@@ -542,8 +855,8 @@ impl BrowserActions {
 
         session.execute_js(&type_script).await?;
 
-        // Wait a bit before pressing enter (like thinking)
-        Self::random_delay(800, 1500).await;
+        // Wait before pressing enter
+        Self::random_delay(300, 600).await;
 
         // Press Enter to search
         session.execute_js(r#"
@@ -557,7 +870,7 @@ impl BrowserActions {
         "#).await?;
 
         // Wait for search results to load
-        Self::random_delay(3000, 5000).await;
+        Self::random_delay(1500, 2500).await;
 
         // Check for CAPTCHA after search
         if Self::check_google_captcha(session).await? {
@@ -580,21 +893,15 @@ impl BrowserActions {
     pub async fn click_grintahub_result(session: &Arc<BrowserSession>) -> Result<bool, BrowserError> {
         info!("Session {} looking for grintahub.com in SPONSORED ADS", session.id);
 
-        // Scroll down a bit first (human behavior)
+        // Quick scroll to see ads
         session.execute_js(r#"
             (async function() {
-                // Random scroll to simulate reading results
-                for (let i = 0; i < 2; i++) {
-                    await new Promise(r => setTimeout(r, 500 + Math.random() * 1000));
-                    window.scrollBy({
-                        top: 150 + Math.random() * 200,
-                        behavior: 'smooth'
-                    });
-                }
+                await new Promise(r => setTimeout(r, 150 + Math.random() * 200));
+                window.scrollBy({ top: 150 + Math.random() * 200, behavior: 'smooth' });
             })()
         "#).await?;
 
-        Self::random_delay(1000, 2000).await;
+        Self::random_delay(200, 400).await;
 
         // Find grintahub.com links in SPONSORED ADS only
         let find_result = session.execute_js(r#"
@@ -721,7 +1028,7 @@ impl BrowserActions {
         info!("Session {} found {} grintahub SPONSORED ADS (type: {})", session.id, count, ad_type);
 
         // Wait after scrolling
-        Self::random_delay(800, 1500).await;
+        Self::random_delay(200, 400).await;
 
         // Click the AD link with human-like behavior
         let clicked = session.execute_js(r#"
@@ -805,7 +1112,7 @@ impl BrowserActions {
             session.increment_clicks();
             info!("Session {} clicked on grintahub.com result", session.id);
             // Wait for page navigation
-            Self::random_delay(3000, 6000).await;
+            Self::random_delay(1500, 2500).await;
             return Ok(true);
         }
 
@@ -821,7 +1128,7 @@ impl BrowserActions {
             window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
         "#).await?;
 
-        Self::random_delay(1000, 2000).await;
+        Self::random_delay(500, 1000).await;
 
         // Click next page
         let has_next = session.execute_js(r#"
@@ -838,7 +1145,7 @@ impl BrowserActions {
         "#).await?;
 
         if has_next.as_bool() == Some(true) {
-            Self::random_delay(3000, 5000).await;
+            Self::random_delay(1500, 2500).await;
 
             // Check for CAPTCHA after navigating to next page
             if Self::check_google_captcha(session).await? {
@@ -867,32 +1174,19 @@ impl BrowserActions {
             return Ok(());
         }
 
-        // Initial pause - human would look at the page first
-        Self::human_delay(500, 1000).await;
-
-        // Move mouse around like looking at the page
-        // Generate random values before async to avoid Send issues
-        let mouse_x = {
-            let mut rng = rand::thread_rng();
-            400 + rng.gen_range(0..400)
-        };
-        Self::bezier_mouse_move(session, mouse_x, 300).await?;
-        Self::human_delay(300, 500).await;
+        // Brief pause to look at the page
+        Self::human_delay(300, 300).await;
 
         // Use enhanced human-like scroll reading
         Self::human_scroll_read(session).await?;
 
         // Time spent on page after scrolling
-        Self::random_delay(3000, 8000).await;
+        Self::random_delay(1000, 2000).await;
 
         // Maybe click on something on the page (40% chance)
         let should_click = rand::thread_rng().gen_bool(0.4);
         if should_click {
-            // First try to move mouse to an interesting element
-            let found_element = Self::bezier_mouse_to_element(session, "a[href*='/ads/'], a[href*='/listing/'], .card, .item").await?;
-
-            if found_element {
-                Self::human_delay(200, 400).await;
+            {
 
                 session.execute_js(r#"
                     (async function() {
@@ -922,21 +1216,14 @@ impl BrowserActions {
                     })()
                 "#).await?;
 
-                Self::random_delay(3000, 6000).await;
+                Self::random_delay(1000, 2000).await;
 
                 // Browse the sub-page too
                 Self::human_scroll_read(session).await?;
             }
         }
 
-        // Move mouse around before leaving
-        let (random_x, random_y) = {
-            let mut rng = rand::thread_rng();
-            (200 + rng.gen_range(0..600), 200 + rng.gen_range(0..300))
-        };
-        Self::bezier_mouse_move(session, random_x, random_y).await?;
-
-        Self::random_delay(500, 1500).await;
+        Self::random_delay(300, 700).await;
         Ok(())
     }
 
@@ -946,39 +1233,19 @@ impl BrowserActions {
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
 
-    /// Simulate human-like mouse movements
-    pub async fn simulate_human_mouse(session: &Arc<BrowserSession>) -> Result<(), BrowserError> {
-        session.execute_js(r#"
-            (async function() {
-                // Create fake mouse movement events
-                const moves = 3 + Math.floor(Math.random() * 4);
-                for (let i = 0; i < moves; i++) {
-                    const x = Math.floor(Math.random() * window.innerWidth);
-                    const y = Math.floor(Math.random() * window.innerHeight);
-
-                    document.dispatchEvent(new MouseEvent('mousemove', {
-                        clientX: x,
-                        clientY: y,
-                        bubbles: true
-                    }));
-
-                    await new Promise(r => setTimeout(r, 100 + Math.random() * 300));
-                }
-            })()
-        "#).await?;
+    /// Mouse simulation disabled - not effective for anti-detection
+    pub async fn simulate_human_mouse(_session: &Arc<BrowserSession>) -> Result<(), BrowserError> {
         Ok(())
     }
 
-    /// Simulate human-like reading behavior
+    /// Simulate human-like reading behavior (fast)
     pub async fn simulate_reading(session: &Arc<BrowserSession>) -> Result<(), BrowserError> {
         session.execute_js(r#"
             (async function() {
-                // Random pauses like reading
-                const pauses = 2 + Math.floor(Math.random() * 3);
+                // Quick glance at results
+                const pauses = 1 + Math.floor(Math.random() * 2);
                 for (let i = 0; i < pauses; i++) {
-                    await new Promise(r => setTimeout(r, 500 + Math.random() * 1500));
-
-                    // Small scroll adjustments
+                    await new Promise(r => setTimeout(r, 200 + Math.random() * 400));
                     const scrollAmount = -20 + Math.floor(Math.random() * 40);
                     window.scrollBy({ top: scrollAmount, behavior: 'smooth' });
                 }
@@ -987,93 +1254,14 @@ impl BrowserActions {
         Ok(())
     }
 
-    /// Bezier curve mouse movement - much more realistic than random jumps
-    /// Uses cubic bezier interpolation with random control points
-    pub async fn bezier_mouse_move(session: &Arc<BrowserSession>, target_x: i32, target_y: i32) -> Result<(), BrowserError> {
-        session.execute_js(&format!(r#"
-            (async function() {{
-                // Get current mouse position from last known position or default to center
-                const startX = window._lastMouseX || window.innerWidth / 2;
-                const startY = window._lastMouseY || window.innerHeight / 2;
-                const endX = {};
-                const endY = {};
-
-                // Generate random control points for natural curve
-                // Human mouse movements follow curved paths, not straight lines
-                const midX = (startX + endX) / 2;
-                const midY = (startY + endY) / 2;
-
-                // Add randomness to control points (creates natural curve variations)
-                const cp1x = startX + (endX - startX) * 0.25 + (Math.random() - 0.5) * 100;
-                const cp1y = startY + (endY - startY) * 0.25 + (Math.random() - 0.5) * 100;
-                const cp2x = startX + (endX - startX) * 0.75 + (Math.random() - 0.5) * 100;
-                const cp2y = startY + (endY - startY) * 0.75 + (Math.random() - 0.5) * 100;
-
-                // Calculate distance for step count (longer distance = more steps)
-                const distance = Math.sqrt(Math.pow(endX - startX, 2) + Math.pow(endY - startY, 2));
-                const steps = Math.max(15, Math.min(50, Math.floor(distance / 20))) + Math.floor(Math.random() * 10);
-
-                // Cubic bezier interpolation
-                for (let i = 0; i <= steps; i++) {{
-                    const t = i / steps;
-                    const t2 = t * t;
-                    const t3 = t2 * t;
-                    const mt = 1 - t;
-                    const mt2 = mt * mt;
-                    const mt3 = mt2 * mt;
-
-                    // Cubic bezier formula
-                    const x = mt3 * startX + 3 * mt2 * t * cp1x + 3 * mt * t2 * cp2x + t3 * endX;
-                    const y = mt3 * startY + 3 * mt2 * t * cp1y + 3 * mt * t2 * cp2y + t3 * endY;
-
-                    // Add micro-jitter for realism (human hands shake slightly)
-                    const jitterX = (Math.random() - 0.5) * 2;
-                    const jitterY = (Math.random() - 0.5) * 2;
-
-                    document.dispatchEvent(new MouseEvent('mousemove', {{
-                        clientX: x + jitterX,
-                        clientY: y + jitterY,
-                        bubbles: true,
-                        cancelable: true,
-                        view: window
-                    }}));
-
-                    // Variable delay - slower at start and end (acceleration curve)
-                    const speedFactor = 4 * t * (1 - t); // Peaks at t=0.5
-                    const baseDelay = 5 + Math.random() * 10;
-                    const delay = baseDelay + (1 - speedFactor) * 15;
-                    await new Promise(r => setTimeout(r, delay));
-                }}
-
-                // Store final position for next movement
-                window._lastMouseX = endX;
-                window._lastMouseY = endY;
-            }})()
-        "#, target_x, target_y)).await?;
+    /// Mouse movement disabled - not effective for anti-detection
+    pub async fn bezier_mouse_move(_session: &Arc<BrowserSession>, _target_x: i32, _target_y: i32) -> Result<(), BrowserError> {
         Ok(())
     }
 
-    /// Move mouse to element using bezier curve
-    pub async fn bezier_mouse_to_element(session: &Arc<BrowserSession>, selector: &str) -> Result<bool, BrowserError> {
-        let result = session.execute_js(&format!(r#"
-            (function() {{
-                const el = document.querySelector('{}');
-                if (!el) return null;
-                const rect = el.getBoundingClientRect();
-                // Aim for slightly randomized position within element
-                const x = rect.left + rect.width * (0.3 + Math.random() * 0.4);
-                const y = rect.top + rect.height * (0.3 + Math.random() * 0.4);
-                return {{ x: Math.floor(x), y: Math.floor(y) }};
-            }})()
-        "#, selector.replace('\'', "\\'"))).await?;
-
-        if let Some(coords) = result.as_object() {
-            if let (Some(x), Some(y)) = (coords.get("x").and_then(|v| v.as_i64()), coords.get("y").and_then(|v| v.as_i64())) {
-                Self::bezier_mouse_move(session, x as i32, y as i32).await?;
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    /// Mouse to element disabled - not effective for anti-detection
+    pub async fn bezier_mouse_to_element(_session: &Arc<BrowserSession>, _selector: &str) -> Result<bool, BrowserError> {
+        Ok(true)
     }
 
     /// Enhanced human scroll with reading simulation
@@ -1124,23 +1312,23 @@ impl BrowserActions {
                         requestAnimationFrame(animate);
                     });
 
-                    // Reading pause - varies based on "content complexity"
+                    // Reading pause - fast but varied
                     const pauseTime = contentComplexity > 0.7
-                        ? 1000 + Math.random() * 3000  // Long pause for complex content
-                        : 300 + Math.random() * 1000;  // Short pause for simple content
+                        ? 400 + Math.random() * 800   // Complex content
+                        : 150 + Math.random() * 400;  // Simple content
                     await new Promise(r => setTimeout(r, pauseTime));
 
-                    // Occasional scroll back up (re-reading behavior - 10% chance)
+                    // Occasional scroll back up (re-reading - 10% chance)
                     if (Math.random() < 0.1) {
                         const scrollBack = 30 + Math.random() * 80;
                         window.scrollBy({ top: -scrollBack, behavior: 'smooth' });
-                        await new Promise(r => setTimeout(r, 500 + Math.random() * 1000));
+                        await new Promise(r => setTimeout(r, 200 + Math.random() * 400));
                         currentPos = window.scrollY;
                     }
 
-                    // Occasional pause to "think" (5% chance)
+                    // Occasional brief pause (5% chance)
                     if (Math.random() < 0.05) {
-                        await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
+                        await new Promise(r => setTimeout(r, 500 + Math.random() * 1000));
                     }
 
                     // Random mouse movement while reading
@@ -1166,9 +1354,7 @@ impl BrowserActions {
     /// Add random delays with human variance
     pub async fn human_delay(base_ms: u64, variance_ms: u64) {
         let delay = base_ms + rand::thread_rng().gen_range(0..=variance_ms);
-        // Add micro-variations to seem more human
-        let micro_delay = rand::thread_rng().gen_range(0..=100);
-        tokio::time::sleep(Duration::from_millis(delay + micro_delay)).await;
+        tokio::time::sleep(Duration::from_millis(delay)).await;
     }
 
     /// Run a full cycle: Google search -> find grintahub AD -> click -> browse
@@ -1186,61 +1372,85 @@ impl BrowserActions {
         // 1. Go to Google with human-like behavior
         Self::goto_google(session).await?;
 
-        // Move mouse naturally around the page using bezier curves
-        // Generate random values before async to avoid Send issues
-        let (center_x, center_y) = {
-            let mut rng = rand::thread_rng();
-            (400 + rng.gen_range(0..200), 300 + rng.gen_range(0..100))
-        };
-        Self::bezier_mouse_move(session, center_x, center_y).await?;
-        Self::human_delay(300, 700).await;
-
-        // Move to search box area with bezier curve
-        Self::bezier_mouse_to_element(session, "input[name='q'], textarea[name='q']").await?;
-        Self::human_delay(200, 400).await;
-
         // 2. Search on Google with the keyword
         let has_results = Self::google_search(session, keyword).await?;
 
         if !has_results {
-            warn!("Session {} no Google results found", session.id);
-            Self::human_delay(min_delay_ms, max_delay_ms - min_delay_ms).await;
-            // No results = change IP
+            warn!("Session {} no Google results found - fast IP change", session.id);
             return Err(BrowserError::ElementNotFound("No Google results - need new IP".into()));
         }
 
-        // Simulate reading search results with bezier mouse movements
+        // Quick glance at search results
         Self::simulate_reading(session).await?;
-
-        // Move mouse around the search results naturally
-        let (results_x, results_y) = {
-            let mut rng = rand::thread_rng();
-            (300 + rng.gen_range(0..300), 400 + rng.gen_range(0..200))
-        };
-        Self::bezier_mouse_move(session, results_x, results_y).await?;
-        Self::human_delay(300, 600).await;
 
         // 3. Try to find and click grintahub.com SPONSORED AD - FIRST PAGE ONLY
         let clicked = Self::click_grintahub_result(session).await?;
 
         if clicked {
-            // Wait for page to load after click
-            Self::human_delay(1500, 3000).await;
+            // Wait for the redirect to complete and page to load
+            info!("Session {} ad clicked - waiting for redirect to grintahub.com...", session.id);
 
-            // 4. Browse the grintahub page with enhanced human behavior
-            Self::browse_grintahub_page(session).await?;
+            // Wait for page load (check document.readyState and URL)
+            for attempt in 0..10 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let page_state = session.execute_js(r#"
+                    (function() {
+                        return {
+                            url: window.location.href,
+                            ready: document.readyState,
+                            onGrinta: window.location.hostname.includes('grintahub')
+                        };
+                    })()
+                "#).await;
+
+                match page_state {
+                    Ok(state) => {
+                        let on_grinta = state.get("onGrinta").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let ready = state.get("ready").and_then(|v| v.as_str()).unwrap_or("loading");
+                        if on_grinta && (ready == "complete" || ready == "interactive") {
+                            info!("Session {} landed on grintahub.com (attempt {})", session.id, attempt + 1);
+                            break;
+                        }
+                        debug!("Session {} page state: ready={}, onGrinta={} (attempt {})", session.id, ready, on_grinta, attempt + 1);
+                    }
+                    Err(_) => {
+                        // Context may be destroyed during navigation - wait more
+                        debug!("Session {} waiting for navigation to settle (attempt {})", session.id, attempt + 1);
+                    }
+                }
+            }
+
+            // 4. Browse the grintahub page (non-fatal - click already counted)
+            let browse_start = std::time::Instant::now();
+            if let Err(e) = Self::browse_grintahub_page(session).await {
+                warn!("Session {} browse error (click already counted): {}", session.id, e);
+            }
+            let browse_elapsed = browse_start.elapsed().as_millis() as u64;
+
+            // 5. CRITICAL: Dwell time on landing page (20-40 seconds total)
+            // Google flags clicks as invalid if dwell time is too short.
+            // The page is still open in the browser even if CDP context is lost.
+            let min_dwell_ms: u64 = 20_000;
+            let max_dwell_ms: u64 = 40_000;
+            let target_dwell = {
+                let mut rng = rand::thread_rng();
+                rng.gen_range(min_dwell_ms..=max_dwell_ms)
+            };
+            if browse_elapsed < target_dwell {
+                let remaining = target_dwell - browse_elapsed;
+                info!("Session {} dwell time: staying {}ms more on grintahub (browsed {}ms, target {}ms)",
+                    session.id, remaining, browse_elapsed, target_dwell);
+                tokio::time::sleep(Duration::from_millis(remaining)).await;
+            }
 
             // Random delay before next cycle
             Self::human_delay(min_delay_ms, max_delay_ms - min_delay_ms).await;
 
-            info!("Session {} completed successful ad click cycle", session.id);
+            info!("Session {} completed successful ad click cycle (dwell: {}ms)", session.id, target_dwell);
             Ok(true)
         } else {
-            // NO AD FOUND on first page = change IP and try again
-            info!("Session {} no grintahub.com SPONSORED AD found on first page - changing IP", session.id);
-            Self::human_delay(1000, 2000).await;
-
-            // Return error to trigger IP change
+            // NO AD FOUND on first page = FAST IP change, no delay
+            info!("Session {} no grintahub.com SPONSORED AD found - fast IP change", session.id);
             Err(BrowserError::ElementNotFound("No sponsored ad found - need new IP".into()))
         }
     }

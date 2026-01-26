@@ -18,7 +18,6 @@ Thumbs.db
 
 # Rust
 *.rs.bk
-Cargo.lock
 
 # Tauri
 src-tauri/target/

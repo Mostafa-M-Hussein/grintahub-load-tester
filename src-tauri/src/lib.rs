@@ -84,16 +84,16 @@ impl Default for AppConfig {
             proxy_sesstime: default_sesstime(),
             proxy_verified: false,
             captcha_api_key: String::new(),
-            concurrent_sessions: 3,
+            concurrent_sessions: 5,
             headless: false,
-            clicks_per_hour: 60,
-            min_delay_ms: 5000,
-            max_delay_ms: 30000,
-            max_clicks_per_session: 0,  // 0 = unlimited
+            clicks_per_hour: 120,
+            min_delay_ms: 3000,
+            max_delay_ms: 10000,
+            max_clicks_per_session: 0,  // 0 = unlimited (NEVER stop)
             keywords: vec![],
             schedule: ScheduleConfig::default(),
             accounts: vec![],
-            auto_rotate_ip: false,  // Disabled by default
+            auto_rotate_ip: true,  // Rotate IP after completing all keywords
         }
     }
 }

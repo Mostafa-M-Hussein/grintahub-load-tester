@@ -65,6 +65,18 @@ impl CaptchaRequest {
         }
     }
 
+    /// Create reCAPTCHA v2 Enterprise request (Google /sorry/ pages use this)
+    pub fn recaptcha_v2_enterprise(sitekey: &str, page_url: &str) -> Self {
+        Self {
+            captcha_type: CaptchaType::RecaptchaV2,
+            sitekey: sitekey.to_string(),
+            page_url: page_url.to_string(),
+            action: None,
+            min_score: None,
+            enterprise: true,
+        }
+    }
+
     /// Create reCAPTCHA v3 request
     pub fn recaptcha_v3(sitekey: &str, page_url: &str, action: &str, min_score: f64) -> Self {
         Self {
@@ -136,6 +148,14 @@ pub struct TwoCaptchaCreateTask {
 pub enum TwoCaptchaTask {
     #[serde(rename = "RecaptchaV2TaskProxyless")]
     RecaptchaV2Proxyless {
+        #[serde(rename = "websiteURL")]
+        website_url: String,
+        #[serde(rename = "websiteKey")]
+        website_key: String,
+    },
+
+    #[serde(rename = "RecaptchaV2EnterpriseTaskProxyless")]
+    RecaptchaV2EnterpriseProxyless {
         #[serde(rename = "websiteURL")]
         website_url: String,
         #[serde(rename = "websiteKey")]

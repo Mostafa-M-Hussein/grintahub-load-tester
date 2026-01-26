@@ -40,8 +40,8 @@ export function StatusBar({ botStatus, stats, scheduleStatus }: StatusBarProps) 
           <span className="value">{botStatus.activeSessions}</span>
         </div>
         <div className="stat">
-          <span className="label">Clicks</span>
-          <span className="value">{stats.totalClicks}</span>
+          <span className="label">Ad Clicks</span>
+          <span className="value">{stats.totalSuccess}</span>
         </div>
         <div className="stat">
           <span className="label">Clicks/hr</span>
@@ -56,8 +56,8 @@ export function StatusBar({ botStatus, stats, scheduleStatus }: StatusBarProps) 
           </span>
         </div>
         <div className="stat">
-          <span className="label">Avg Latency</span>
-          <span className="value">{stats.averageLatencyMs.toFixed(0)}ms</span>
+          <span className="label">Errors</span>
+          <span className="value">{stats.totalErrors}</span>
         </div>
       </div>
 

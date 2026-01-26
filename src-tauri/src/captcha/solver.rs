@@ -163,6 +163,10 @@ impl CaptchaSolver {
         let url = format!("{}/createTask", TWOCAPTCHA_API);
 
         let task = match request.captcha_type {
+            CaptchaType::RecaptchaV2 if request.enterprise => TwoCaptchaTask::RecaptchaV2EnterpriseProxyless {
+                website_url: request.page_url.clone(),
+                website_key: request.sitekey.clone(),
+            },
             CaptchaType::RecaptchaV2 => TwoCaptchaTask::RecaptchaV2Proxyless {
                 website_url: request.page_url.clone(),
                 website_key: request.sitekey.clone(),
