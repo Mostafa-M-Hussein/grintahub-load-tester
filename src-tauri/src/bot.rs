@@ -94,6 +94,10 @@ pub async fn start_bot_logic(state: &AppState) -> Result<(), String> {
 
     info!("Starting bot with {} sessions (headless: {})", config.concurrent_sessions, config.headless);
 
+    // Set headless override on the pool so ALL future spawn_sessions() calls
+    // (IP rotation, error recovery, supervisor respawn) use the correct mode
+    state.browser_pool.set_default_headless(config.headless).await;
+
     let session_ids = state.browser_pool
         .spawn_sessions_with_options(config.concurrent_sessions, Some(config.headless))
         .await

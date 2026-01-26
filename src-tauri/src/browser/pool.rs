@@ -50,6 +50,9 @@ pub struct BrowserPool {
     statuses: Arc<RwLock<HashMap<String, SessionStatus>>>,
     /// Track all IPs used in this run to prevent duplicates
     used_ips: Arc<RwLock<HashSet<String>>>,
+    /// Runtime headless override — set when bot starts so replacement sessions
+    /// spawned via `spawn_sessions(1)` use the correct headless mode.
+    headless_override: RwLock<Option<bool>>,
 }
 
 impl BrowserPool {
@@ -61,6 +64,7 @@ impl BrowserPool {
             default_config: BrowserSessionConfig::default(),
             statuses: Arc::new(RwLock::new(HashMap::new())),
             used_ips: Arc::new(RwLock::new(HashSet::new())),
+            headless_override: RwLock::new(None),
         }
     }
 
@@ -68,6 +72,15 @@ impl BrowserPool {
     pub fn with_config(mut self, config: BrowserSessionConfig) -> Self {
         self.default_config = config;
         self
+    }
+
+    /// Set the default headless mode for all future sessions.
+    ///
+    /// Called when the bot starts so that replacement sessions spawned via
+    /// `spawn_sessions(1)` (IP rotation, error recovery, etc.) inherit
+    /// the correct headless setting from the config.
+    pub async fn set_default_headless(&self, headless: bool) {
+        self.headless_override.write().await.replace(headless);
     }
 
     /// Spawn multiple browser sessions in parallel (uses default headless setting)
@@ -84,7 +97,13 @@ impl BrowserPool {
         use std::time::Duration;
         use futures::future::join_all;
 
-        let headless_mode = headless.unwrap_or(self.default_config.headless);
+        let headless_mode = match headless {
+            Some(h) => h,
+            None => {
+                // Check runtime override first (set by bot on start), fall back to default_config
+                self.headless_override.read().await.unwrap_or(self.default_config.headless)
+            }
+        };
         info!("=== SPAWNING {} BROWSER SESSIONS IN PARALLEL (headless: {}) ===", count, headless_mode);
 
         // Get unique proxies for each session
@@ -263,9 +282,10 @@ impl BrowserPool {
             }
         }
 
-        // Clear statuses and used IPs
+        // Clear statuses, used IPs, and headless override
         self.statuses.write().await.clear();
         self.used_ips.write().await.clear();
+        *self.headless_override.write().await = None;
 
         info!("All browser sessions closed (used IPs cleared)");
         Ok(())
