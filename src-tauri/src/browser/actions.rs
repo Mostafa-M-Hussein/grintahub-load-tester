@@ -878,15 +878,63 @@ impl BrowserActions {
             return Err(BrowserError::CaptchaDetected("CAPTCHA after Google search".into()));
         }
 
-        // Check if results loaded
-        let has_results = session.execute_js(r#"
+        // Check if results loaded and gather debug info
+        let page_info = session.execute_js(r#"
             (function() {
+                const url = window.location.href;
                 const results = document.querySelectorAll('#search a[href], #rso a[href]');
-                return results.length > 0;
+                const topAds = document.querySelectorAll('#tads a[href], #tadsb a[href]');
+                const textAds = document.querySelectorAll('[data-text-ad] a[href]');
+                const sponsoredLabels = document.querySelectorAll('[aria-label*="Sponsored"], [data-dtld], .uEierd');
+                const allLinks = document.querySelectorAll('a[href*="grintahub"]');
+                const bodyText = document.body ? document.body.innerText.substring(0, 500) : '';
+                const title = document.title;
+
+                // Check for error messages
+                const hasNoResults = bodyText.toLowerCase().includes('did not match any') ||
+                                    bodyText.includes('لا توجد نتائج');
+                const hasCaptcha = url.includes('/sorry/') ||
+                                  bodyText.includes('unusual traffic') ||
+                                  bodyText.includes('زيارات غير معتادة');
+
+                return {
+                    url: url,
+                    title: title,
+                    resultCount: results.length,
+                    topAdCount: topAds.length,
+                    textAdCount: textAds.length,
+                    sponsoredCount: sponsoredLabels.length,
+                    grintaLinkCount: allLinks.length,
+                    hasNoResults: hasNoResults,
+                    hasCaptcha: hasCaptcha,
+                    bodyPreview: bodyText.substring(0, 200)
+                };
             })()
         "#).await?;
 
-        Ok(has_results.as_bool().unwrap_or(false))
+        let result_count = page_info.get("resultCount").and_then(|v| v.as_u64()).unwrap_or(0);
+        let top_ad_count = page_info.get("topAdCount").and_then(|v| v.as_u64()).unwrap_or(0);
+        let grinta_count = page_info.get("grintaLinkCount").and_then(|v| v.as_u64()).unwrap_or(0);
+        let url = page_info.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let title = page_info.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let has_captcha = page_info.get("hasCaptcha").and_then(|v| v.as_bool()).unwrap_or(false);
+        let has_no_results = page_info.get("hasNoResults").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        debug!("Session {} search page state: url={}, title={}",
+            session.id, &url[..url.len().min(80)], &title[..title.len().min(50)]);
+        info!("Session {} search results: {} organic, {} top ads, {} grintahub links, captcha={}, noResults={}",
+            session.id, result_count, top_ad_count, grinta_count, has_captcha, has_no_results);
+
+        if has_captcha {
+            let body = page_info.get("bodyPreview").and_then(|v| v.as_str()).unwrap_or("");
+            warn!("Session {} CAPTCHA detected in search results! Body: {}", session.id, body);
+        }
+
+        if has_no_results {
+            warn!("Session {} Google returned no results for keyword", session.id);
+        }
+
+        Ok(result_count > 0)
     }
 
     /// Find and click on grintahub.com SPONSORED AD in Google results
@@ -1019,7 +1067,48 @@ impl BrowserActions {
         let found = find_result.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
 
         if !found {
-            info!("Session {} no grintahub.com SPONSORED ADS found", session.id);
+            // Get more debug info about why no ads were found
+            let debug_info = session.execute_js(r#"
+                (function() {
+                    const url = window.location.href;
+                    const topAdsContainer = document.querySelector('#tads, #tadsb');
+                    const allAds = document.querySelectorAll('[data-text-ad], [data-hveid]');
+                    const sponsoredText = document.body.innerText.includes('Sponsored') ||
+                                         document.body.innerText.includes('إعلان') ||
+                                         document.body.innerText.includes('Ad');
+                    const allLinks = document.querySelectorAll('a[href]');
+                    const grintaAnywhere = Array.from(allLinks).filter(l =>
+                        (l.href || '').toLowerCase().includes('grintahub')
+                    );
+
+                    return {
+                        url: url,
+                        hasTopAdsContainer: !!topAdsContainer,
+                        totalAdElements: allAds.length,
+                        hasSponsoredText: sponsoredText,
+                        totalLinks: allLinks.length,
+                        grintaLinksAnywhere: grintaAnywhere.length,
+                        grintaUrls: grintaAnywhere.slice(0, 5).map(l => l.href)
+                    };
+                })()
+            "#).await.unwrap_or_default();
+
+            let has_top_ads = debug_info.get("hasTopAdsContainer").and_then(|v| v.as_bool()).unwrap_or(false);
+            let total_ads = debug_info.get("totalAdElements").and_then(|v| v.as_u64()).unwrap_or(0);
+            let has_sponsored = debug_info.get("hasSponsoredText").and_then(|v| v.as_bool()).unwrap_or(false);
+            let grinta_anywhere = debug_info.get("grintaLinksAnywhere").and_then(|v| v.as_u64()).unwrap_or(0);
+
+            warn!("Session {} NO grintahub.com SPONSORED ADS - hasTopAds={}, totalAdElements={}, hasSponsoredText={}, grintaLinksAnywhere={}",
+                session.id, has_top_ads, total_ads, has_sponsored, grinta_anywhere);
+
+            if grinta_anywhere > 0 {
+                let urls = debug_info.get("grintaUrls").and_then(|v| v.as_array());
+                if let Some(urls) = urls {
+                    warn!("Session {} grintahub links found (but not in ad sections): {:?}",
+                        session.id, urls.iter().take(3).collect::<Vec<_>>());
+                }
+            }
+
             return Ok(false);
         }
 

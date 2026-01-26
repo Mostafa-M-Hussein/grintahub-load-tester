@@ -192,6 +192,14 @@ impl CaptchaSolver {
             task,
         };
 
+        // Debug: Log the request being sent (without API key)
+        debug!("2Captcha createTask request: type={:?}, enterprise={}, url={}, sitekey={}...",
+            request.captcha_type,
+            request.enterprise,
+            &request.page_url[..request.page_url.len().min(80)],
+            &request.sitekey[..request.sitekey.len().min(20)]
+        );
+
         let response = self.client
             .post(&url)
             .json(&create_request)
@@ -199,17 +207,30 @@ impl CaptchaSolver {
             .await
             .map_err(|e| CaptchaError::NetworkError(e.to_string()))?;
 
-        let result: TwoCaptchaCreateResponse = response.json().await
-            .map_err(|e| CaptchaError::InvalidResponse(e.to_string()))?;
+        // Get raw response text first for debugging
+        let response_text = response.text().await
+            .map_err(|e| CaptchaError::NetworkError(e.to_string()))?;
+
+        debug!("2Captcha createTask response: {}", &response_text[..response_text.len().min(500)]);
+
+        let result: TwoCaptchaCreateResponse = serde_json::from_str(&response_text)
+            .map_err(|e| CaptchaError::InvalidResponse(format!("Parse error: {} - Response: {}", e, &response_text[..response_text.len().min(200)])))?;
 
         if result.error_id != 0 {
-            let error_msg = result.error_description
-                .or(result.error_code)
-                .unwrap_or_else(|| format!("Error ID: {}", result.error_id));
+            // Build detailed error message
+            let error_msg = format!(
+                "errorId={}, code={}, desc={}",
+                result.error_id,
+                result.error_code.as_deref().unwrap_or("none"),
+                result.error_description.as_deref().unwrap_or("none")
+            );
+            info!("2Captcha task creation failed: {}", error_msg);
             return Err(CaptchaError::TaskCreationFailed(error_msg));
         }
 
-        result.task_id.ok_or_else(|| CaptchaError::InvalidResponse("No task ID in response".into()))
+        let task_id = result.task_id.ok_or_else(|| CaptchaError::InvalidResponse("No task ID in response".into()))?;
+        info!("2Captcha task created: ID={}", task_id);
+        Ok(task_id)
     }
 
     /// Get task result from 2Captcha
