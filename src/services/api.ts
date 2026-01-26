@@ -80,6 +80,11 @@ export async function isProxyVerified(): Promise<boolean> {
   return invoke('is_proxy_verified');
 }
 
+// Logs
+export async function getLogDir(): Promise<string> {
+  return invoke('get_log_dir');
+}
+
 // Manual test browser (stays open for user testing)
 export async function openTestBrowser(): Promise<string> {
   return invoke('open_test_browser');

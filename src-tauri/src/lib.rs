@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::path::PathBuf;
 use tokio::sync::RwLock;
 use tracing::{info, warn, error};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tauri::Manager;
 
 use proxy::GlobalProxyManager;
@@ -94,6 +96,11 @@ impl Default for AppConfig {
             auto_rotate_ip: false,  // Disabled by default
         }
     }
+}
+
+/// Get log directory path (shared across modules)
+pub fn log_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("grintahub-clicker").join("logs"))
 }
 
 impl AppConfig {
@@ -258,15 +265,47 @@ impl Default for AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    // Initialize tracing with both console and file logging
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into());
+
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_thread_ids(false);
+
+    // Set up file logging in app config directory
+    let _guard = if let Some(log_dir) = log_dir() {
+        let _ = std::fs::create_dir_all(&log_dir);
+        let file_appender = tracing_appender::rolling::daily(&log_dir, "grintahub-clicker.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_writer(non_blocking);
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_layer)
+            .with(file_layer)
+            .init();
+
+        Some(guard)
+    } else {
+        // Fallback: console-only logging
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_layer)
+            .init();
+
+        None
+    };
 
     info!("Starting GrintaHub Clicker");
+    if let Some(dir) = log_dir() {
+        info!("Log files saved to: {}", dir.display());
+    }
 
     tauri::Builder::default()
         .setup(|app| {
@@ -292,6 +331,7 @@ pub fn run() {
             commands::get_schedule_status,
             commands::test_proxy,
             commands::is_proxy_verified,
+            commands::get_log_dir,
             // Manual test browser
             commands::open_test_browser,
             commands::close_test_browser,

@@ -16,6 +16,34 @@ use rand::Rng;
 use super::BrowserError;
 use crate::proxy::LocalProxyForwarder;
 
+/// Find Chrome/Chromium executable on the system
+fn find_chrome() -> Option<std::path::PathBuf> {
+    let candidates: Vec<std::path::PathBuf> = if cfg!(target_os = "windows") {
+        let mut paths = vec![
+            std::path::PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            std::path::PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+        ];
+        // Also check %LOCALAPPDATA%
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            paths.push(std::path::PathBuf::from(format!(r"{}\Google\Chrome\Application\chrome.exe", local)));
+        }
+        paths
+    } else if cfg!(target_os = "macos") {
+        vec![
+            std::path::PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ]
+    } else {
+        vec![
+            std::path::PathBuf::from("/usr/bin/google-chrome"),
+            std::path::PathBuf::from("/usr/bin/google-chrome-stable"),
+            std::path::PathBuf::from("/usr/bin/chromium"),
+            std::path::PathBuf::from("/usr/bin/chromium-browser"),
+        ]
+    };
+
+    candidates.into_iter().find(|p| p.exists())
+}
+
 /// Rotating user-agents pool - realistic Chrome/Edge on Windows
 const USER_AGENTS: &[&str] = &[
     // Chrome on Windows (most common)
@@ -151,6 +179,13 @@ impl BrowserSession {
 
         info!("Launching browser session {} (headless: {})", session_id, config.headless);
 
+        // Check if Chrome is available before attempting launch
+        if config.chrome_path.is_none() && find_chrome().is_none() {
+            return Err(BrowserError::LaunchFailed(
+                "Google Chrome not found. Please install Chrome from https://www.google.com/chrome/ and restart the app.".to_string()
+            ));
+        }
+
         // Build browser config
         let mut builder = BrowserConfig::builder();
 
@@ -159,9 +194,12 @@ impl BrowserSession {
             builder = builder.with_head();
         }
 
-        // Set Chrome path if specified
+        // Set Chrome path if specified (or use auto-detected path)
         if let Some(ref path) = config.chrome_path {
             builder = builder.chrome_executable(path);
+        } else if let Some(chrome_path) = find_chrome() {
+            info!("Auto-detected Chrome at: {}", chrome_path.display());
+            builder = builder.chrome_executable(chrome_path);
         }
 
         // Set user data directory

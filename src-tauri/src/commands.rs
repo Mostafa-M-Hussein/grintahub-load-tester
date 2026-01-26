@@ -579,6 +579,7 @@ pub struct ProxyTestResult {
 /// Fetch IP without proxy
 async fn fetch_ip_without_proxy() -> Result<String, String> {
     let client = reqwest::Client::builder()
+        .no_proxy() // Disable system proxy settings (important on Windows)
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
@@ -600,14 +601,16 @@ async fn fetch_ip_without_proxy() -> Result<String, String> {
         .ok_or_else(|| "No IP in response".to_string())
 }
 
-/// Fetch IP with proxy
-async fn fetch_ip_with_proxy(proxy_url: &str) -> Result<String, String> {
-    let proxy = Proxy::all(proxy_url)
-        .map_err(|e| format!("Invalid proxy URL: {}", e))?;
+/// Fetch IP with proxy using explicit basic auth (more reliable on Windows than URL-embedded credentials)
+async fn fetch_ip_with_proxy(proxy_host: &str, username: &str, password: &str) -> Result<String, String> {
+    let proxy = Proxy::all(proxy_host)
+        .map_err(|e| format!("Invalid proxy URL: {}", e))?
+        .basic_auth(username, password);
 
     let client = reqwest::Client::builder()
         .proxy(proxy)
         .timeout(Duration::from_secs(30))
+        .danger_accept_invalid_certs(true) // Some proxy tunnels have cert issues on Windows
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
@@ -615,7 +618,7 @@ async fn fetch_ip_with_proxy(proxy_url: &str) -> Result<String, String> {
         .get("https://api.ipify.org/?format=json")
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|e| format!("Proxy request failed: {}", e))?;
 
     let data: serde_json::Value = response
         .json()
@@ -664,22 +667,22 @@ pub async fn test_proxy(state: State<'_, AppState>) -> Result<ProxyTestResult, S
         });
     }
 
-    // Build HTTP proxy URL (port 60000) for more reliable testing
+    // Build proxy credentials for testing (HTTP mode port 60000 is more reliable)
     let sessid = format!("test{}", std::process::id());
-    let password_encoded = urlencoding::encode(&config.proxy_password);
-    let proxy_url = format!(
-        "http://customer-{}-cc-{}-sessid-{}-sesstime-10:{}@pr.oxylabs.io:60000",
+    let proxy_host = "http://pr.oxylabs.io:60000";
+    let proxy_username = format!(
+        "customer-{}-cc-{}-sessid-{}-sesstime-10",
         config.proxy_customer,
         config.proxy_country,
         sessid,
-        password_encoded
     );
+    let proxy_password = config.proxy_password.clone();
     drop(config);
 
     info!("Testing HTTP proxy @ pr.oxylabs.io:60000 with sessid={}", sessid);
 
-    // Step 3: Get IP through proxy
-    match fetch_ip_with_proxy(&proxy_url).await {
+    // Step 3: Get IP through proxy (using explicit basic auth, not URL-embedded credentials)
+    match fetch_ip_with_proxy(proxy_host, &proxy_username, &proxy_password).await {
         Ok(proxy_ip) => {
             let test_time_ms = start.elapsed().as_millis() as u64;
             let working = original_ip != proxy_ip;
@@ -726,6 +729,14 @@ pub async fn test_proxy(state: State<'_, AppState>) -> Result<ProxyTestResult, S
 #[tauri::command]
 pub async fn is_proxy_verified(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(state.proxy_manager.is_verified())
+}
+
+/// Get the log directory path so the user can find log files
+#[tauri::command]
+pub async fn get_log_dir() -> Result<String, String> {
+    crate::log_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| "Could not determine log directory".to_string())
 }
 
 // ========== CAPTCHA Commands ==========

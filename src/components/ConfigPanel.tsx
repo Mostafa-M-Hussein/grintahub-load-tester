@@ -47,6 +47,8 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
 
   // Save button feedback state
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
+  // Password visibility toggle
+  const [showProxyPassword, setShowProxyPassword] = useState(false);
 
   // Sync local state when parent config changes (e.g., after loading from backend)
   useEffect(() => {
@@ -252,12 +254,22 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
         </div>
         <div className="form-group">
           <label>Password</label>
-          <input
-            type="password"
-            value={localConfig.proxyPassword}
-            onChange={e => handleChange('proxyPassword', e.target.value)}
-            placeholder="Oxylabs password"
-          />
+          <div className="password-input-wrapper">
+            <input
+              type={showProxyPassword ? 'text' : 'password'}
+              value={localConfig.proxyPassword}
+              onChange={e => handleChange('proxyPassword', e.target.value)}
+              placeholder="Oxylabs password"
+            />
+            <button
+              type="button"
+              className="password-toggle-btn"
+              onClick={() => setShowProxyPassword(!showProxyPassword)}
+              tabIndex={-1}
+            >
+              {showProxyPassword ? 'Hide' : 'Show'}
+            </button>
+          </div>
         </div>
         <div className="form-group">
           <label>Country</label>
