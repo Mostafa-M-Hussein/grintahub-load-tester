@@ -603,6 +603,8 @@ async fn fetch_ip_without_proxy() -> Result<String, String> {
 
 /// Fetch IP with proxy using explicit basic auth (more reliable on Windows than URL-embedded credentials)
 async fn fetch_ip_with_proxy(proxy_host: &str, username: &str, password: &str) -> Result<String, String> {
+    info!("Proxy test: connecting to {} as user '{}'", proxy_host, &username[..username.len().min(40)]);
+
     let proxy = Proxy::all(proxy_host)
         .map_err(|e| format!("Invalid proxy URL: {}", e))?
         .basic_auth(username, password);
@@ -610,25 +612,54 @@ async fn fetch_ip_with_proxy(proxy_host: &str, username: &str, password: &str) -
     let client = reqwest::Client::builder()
         .proxy(proxy)
         .timeout(Duration::from_secs(30))
-        .danger_accept_invalid_certs(true) // Some proxy tunnels have cert issues on Windows
+        .danger_accept_invalid_certs(true)
         .build()
-        .map_err(|e| format!("Failed to create client: {}", e))?;
+        .map_err(|e| format!("Failed to create proxy client: {:?}", e))?;
 
-    let response = client
-        .get("https://api.ipify.org/?format=json")
-        .send()
-        .await
-        .map_err(|e| format!("Proxy request failed: {}", e))?;
+    // Use HTTP (not HTTPS) to avoid CONNECT tunnel issues on Windows
+    // Plain HTTP goes directly through the proxy without TLS tunneling
+    let ip_services = [
+        "http://api.ipify.org/?format=json",
+        "http://httpbin.org/ip",
+        "http://ip-api.com/json",
+    ];
 
-    let data: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+    let mut last_error = String::new();
+    for url in &ip_services {
+        info!("Proxy test: trying {}", url);
+        match client.get(*url).send().await {
+            Ok(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    last_error = format!("HTTP {} from {}: {}", status, url, body);
+                    warn!("Proxy test: {}", last_error);
+                    continue;
+                }
+                let text = response.text().await
+                    .map_err(|e| format!("Failed to read response: {:?}", e))?;
+                info!("Proxy test: got response from {}: {}", url, &text[..text.len().min(200)]);
 
-    data.get("ip")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "No IP in response".to_string())
+                // Parse IP from JSON response
+                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                    // Try common JSON fields: "ip", "origin", "query"
+                    for field in &["ip", "origin", "query"] {
+                        if let Some(ip) = data.get(*field).and_then(|v| v.as_str()) {
+                            return Ok(ip.trim().to_string());
+                        }
+                    }
+                }
+                return Err(format!("No IP found in response: {}", &text[..text.len().min(100)]));
+            }
+            Err(e) => {
+                last_error = format!("{}: {:?}", url, e);
+                warn!("Proxy test failed for {}: {:?}", url, e);
+                continue;
+            }
+        }
+    }
+
+    Err(format!("All IP services failed through proxy. Last error: {}", last_error))
 }
 
 /// Test proxy connectivity by comparing IPs with and without proxy
