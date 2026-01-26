@@ -65,6 +65,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [activeTab, setActiveTab] = useState<TabType>('config');
+  const [startTime, setStartTime] = useState<number | null>(null);
 
   // Load initial config
   useEffect(() => {
@@ -115,6 +116,7 @@ function App() {
       // Auto-save config before starting to ensure latest settings are used
       await api.configure(config);
       await api.startBot();
+      setStartTime(Date.now()); // Start the timer
     } catch (err) {
       setError(String(err));
     } finally {
@@ -127,6 +129,7 @@ function App() {
     setError(null);
     try {
       await api.stopBot();
+      // Don't clear startTime immediately - keep showing final elapsed time
     } catch (err) {
       setError(String(err));
     } finally {
@@ -182,6 +185,7 @@ function App() {
         botStatus={botStatus}
         stats={stats}
         scheduleStatus={scheduleStatus}
+        startTime={startTime}
       />
 
       <main className="app-main">

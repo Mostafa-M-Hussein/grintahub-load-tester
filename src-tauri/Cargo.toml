@@ -12,13 +12,27 @@ rust-version = "1.77.2"
 name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "grintahub-clicker"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
 [build-dependencies]
-tauri-build = { version = "2.5.3", features = [] }
+tauri-build = { version = "2.5.3", features = [], optional = true }
 
 [dependencies]
-# Tauri
-tauri = { version = "2.9.5", features = ["tray-icon"] }
-tauri-plugin-log = "2"
+# Desktop (Tauri) - optional, not needed for server-only builds
+tauri = { version = "2.9.5", features = ["tray-icon"], optional = true }
+tauri-plugin-log = { version = "2", optional = true }
+
+# Web server (for headless server mode)
+axum = "0.7"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower = "0.5"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -61,5 +75,6 @@ log = "0.4"
 dirs = "6"
 
 [features]
-default = ["custom-protocol"]
-custom-protocol = ["tauri/custom-protocol"]
+default = ["desktop", "custom-protocol"]
+desktop = ["dep:tauri", "dep:tauri-plugin-log", "dep:tauri-build"]
+custom-protocol = ["desktop", "tauri/custom-protocol"]

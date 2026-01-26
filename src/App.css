@@ -124,6 +124,48 @@ body {
   50% { opacity: 0.5; }
 }
 
+.status-indicator .elapsed-time {
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--accent-blue);
+  background: rgba(66, 153, 225, 0.15);
+  padding: 0.25rem 0.75rem;
+  border-radius: 4px;
+  margin-left: 0.5rem;
+}
+
+.proxy-usage {
+  font-size: 0.85rem;
+  padding: 0.25rem 0.75rem;
+  background: rgba(236, 201, 75, 0.15);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.proxy-usage:hover {
+  background: rgba(236, 201, 75, 0.25);
+}
+
+.proxy-usage .usage {
+  color: var(--accent-yellow);
+  font-weight: 500;
+}
+
+.proxy-usage .remaining {
+  color: var(--accent-green);
+  font-weight: 600;
+}
+
+.proxy-usage .loading {
+  color: var(--text-secondary);
+}
+
+.proxy-usage .error {
+  color: var(--text-secondary);
+}
+
 .status-stats {
   display: flex;
   gap: 1.5rem;

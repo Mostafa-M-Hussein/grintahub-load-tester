@@ -10,15 +10,17 @@ pub mod rate;
 pub mod scheduler;
 pub mod captcha;
 pub mod auth;
+pub mod supervisor;
+pub mod bot;
+pub mod web;
+
+#[cfg(feature = "desktop")]
 mod commands;
 
 use std::sync::Arc;
 use std::path::PathBuf;
 use tokio::sync::RwLock;
 use tracing::{info, warn, error};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tauri::Manager;
 
 use proxy::GlobalProxyManager;
 use browser::BrowserPool;
@@ -177,6 +179,8 @@ pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     /// Bot running state
     pub is_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Supervisor task handle (for stopping it on bot stop)
+    pub supervisor_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -221,6 +225,7 @@ impl AppState {
             scheduler: Arc::new(Scheduler::new()),
             config: Arc::new(RwLock::new(saved_config)),
             is_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            supervisor_handle: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -263,9 +268,11 @@ impl Default for AppState {
     }
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    // Initialize tracing with both console and file logging
+/// Initialize logging (shared between desktop and server modes)
+pub fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let env_filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive(tracing::Level::INFO.into());
 
@@ -273,8 +280,7 @@ pub fn run() {
         .with_target(true)
         .with_thread_ids(false);
 
-    // Set up file logging in app config directory
-    let _guard = if let Some(log_dir) = log_dir() {
+    if let Some(log_dir) = log_dir() {
         let _ = std::fs::create_dir_all(&log_dir);
         let file_appender = tracing_appender::rolling::daily(&log_dir, "grintahub-clicker.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -293,16 +299,24 @@ pub fn run() {
 
         Some(guard)
     } else {
-        // Fallback: console-only logging
         tracing_subscriber::registry()
             .with(env_filter)
             .with(console_layer)
             .init();
 
         None
-    };
+    }
+}
 
-    info!("Starting GrintaHub Clicker");
+/// Desktop (Tauri) entry point
+#[cfg(feature = "desktop")]
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    use tauri::Manager;
+
+    let _guard = init_logging();
+
+    info!("Starting GrintaHub Clicker (desktop mode)");
     if let Some(dir) = log_dir() {
         info!("Log files saved to: {}", dir.display());
     }
@@ -346,6 +360,8 @@ pub fn run() {
             commands::batch_register_accounts,
             commands::get_saved_accounts,
             commands::delete_account,
+            // Oxylabs usage
+            commands::get_oxylabs_usage,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
