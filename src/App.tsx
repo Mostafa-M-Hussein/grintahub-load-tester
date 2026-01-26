@@ -5,6 +5,7 @@ import { SessionDashboard } from './components/SessionDashboard';
 import { StatusBar } from './components/StatusBar';
 import { Controls } from './components/Controls';
 import * as api from './services/api';
+import { isServerMode, setServerAuth } from './services/api';
 import type {
   AppConfig,
   SessionInfo,
@@ -67,15 +68,42 @@ function App() {
   const [activeTab, setActiveTab] = useState<TabType>('config');
   const [startTime, setStartTime] = useState<number | null>(null);
 
-  // Load initial config
+  // Server mode login state
+  const needsAuth = isServerMode();
+  const [authenticated, setAuthenticated] = useState(!needsAuth || !!localStorage.getItem('grintahub_auth'));
+  const [loginUser, setLoginUser] = useState('admin');
+  const [loginPass, setLoginPass] = useState('');
+  const [loginError, setLoginError] = useState('');
+
+  const handleLogin = useCallback(async () => {
+    setServerAuth(loginUser, loginPass);
+    try {
+      // Test credentials with a simple API call
+      await api.getBotStatus();
+      setAuthenticated(true);
+      setLoginError('');
+    } catch {
+      localStorage.removeItem('grintahub_auth');
+      setLoginError('Invalid credentials');
+    }
+  }, [loginUser, loginPass]);
+
+  // Load initial config (only when authenticated)
   useEffect(() => {
+    if (!authenticated) return;
     api.getConfig()
       .then(setConfig)
-      .catch(err => console.error('Failed to load config:', err));
-  }, []);
+      .catch(err => {
+        console.error('Failed to load config:', err);
+        if (String(err).includes('Authentication required')) {
+          setAuthenticated(false);
+        }
+      });
+  }, [authenticated]);
 
-  // Poll for status updates
+  // Poll for status updates (only when authenticated)
   useEffect(() => {
+    if (!authenticated) return;
     const interval = setInterval(async () => {
       try {
         const [newStatus, newStats, newSessions, newSchedule] = await Promise.all([
@@ -90,11 +118,14 @@ function App() {
         setScheduleStatus(newSchedule);
       } catch (err) {
         console.error('Failed to fetch status:', err);
+        if (String(err).includes('Authentication required')) {
+          setAuthenticated(false);
+        }
       }
     }, 2000);
 
     return () => clearInterval(interval);
-  }, []);
+  }, [authenticated]);
 
   const handleSaveConfig = useCallback(async (newConfig: AppConfig) => {
     setLoading(true);
@@ -161,6 +192,41 @@ function App() {
       setError(String(err));
     }
   }, []);
+
+  // Show login screen in server mode when not authenticated
+  if (!authenticated) {
+    return (
+      <div className="app">
+        <div className="login-screen">
+          <div className="login-card">
+            <h1>GrintaHub Clicker</h1>
+            <p className="login-subtitle">Server Dashboard</p>
+            {loginError && <div className="login-error">{loginError}</div>}
+            <form onSubmit={(e) => { e.preventDefault(); handleLogin(); }}>
+              <div className="login-field">
+                <label>Username</label>
+                <input
+                  type="text"
+                  value={loginUser}
+                  onChange={e => setLoginUser(e.target.value)}
+                  autoFocus
+                />
+              </div>
+              <div className="login-field">
+                <label>Password</label>
+                <input
+                  type="password"
+                  value={loginPass}
+                  onChange={e => setLoginPass(e.target.value)}
+                />
+              </div>
+              <button type="submit" className="login-btn">Login</button>
+            </form>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="app">

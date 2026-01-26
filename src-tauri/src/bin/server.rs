@@ -39,6 +39,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize application state
     let state = Arc::new(app_lib::AppState::new());
 
+    // Server mode: force headless since there's no display
+    {
+        let mut config = state.config.write().await;
+        if !config.headless {
+            info!("Server mode: forcing headless=true (no display available)");
+            config.headless = true;
+            config.save();
+        }
+    }
+
     info!("Application state initialized");
     info!("Dashboard: http://0.0.0.0:{}", port);
 
