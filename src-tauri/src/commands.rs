@@ -738,12 +738,13 @@ async fn fetch_ip_without_proxy() -> Result<String, String> {
         .ok_or_else(|| "No IP in response".to_string())
 }
 
-/// Fetch IP with proxy using URL-embedded credentials
-async fn fetch_ip_with_proxy(proxy_url: &str) -> Result<String, String> {
-    info!("Proxy test: connecting via {}", &proxy_url[..proxy_url.len().min(60)]);
+/// Fetch IP with proxy using explicit basic auth (works reliably on Windows)
+async fn fetch_ip_with_proxy(proxy_host: &str, username: &str, password: &str) -> Result<String, String> {
+    info!("Proxy test: connecting via {} (user: {}...)", proxy_host, &username[..username.len().min(30)]);
 
-    let proxy = Proxy::all(proxy_url)
-        .map_err(|e| format!("Invalid proxy URL: {}", e))?;
+    let proxy = Proxy::all(proxy_host)
+        .map_err(|e| format!("Invalid proxy URL: {}", e))?
+        .basic_auth(username, password);
 
     let client = reqwest::Client::builder()
         .proxy(proxy)
@@ -809,22 +810,22 @@ pub async fn test_proxy(state: State<'_, AppState>) -> Result<ProxyTestResult, S
         });
     }
 
-    // Build proxy URL with embedded credentials (HTTP mode port 60000)
+    // Build proxy credentials (HTTP mode port 60000)
     let sessid = format!("test{}", std::process::id());
-    let password_encoded = urlencoding::encode(&config.proxy_password);
-    let proxy_url = format!(
-        "http://customer-{}-cc-{}-sessid-{}-sesstime-10:{}@pr.oxylabs.io:60000",
+    let proxy_host = "http://pr.oxylabs.io:60000";
+    let proxy_username = format!(
+        "customer-{}-cc-{}-sessid-{}-sesstime-10",
         config.proxy_customer,
         config.proxy_country,
         sessid,
-        password_encoded
     );
+    let proxy_password = config.proxy_password.clone();
     drop(config);
 
     info!("Testing HTTP proxy @ pr.oxylabs.io:60000 with sessid={}", sessid);
 
-    // Step 3: Get IP through proxy
-    match fetch_ip_with_proxy(&proxy_url).await {
+    // Step 3: Get IP through proxy (using explicit basic auth)
+    match fetch_ip_with_proxy(proxy_host, &proxy_username, &proxy_password).await {
         Ok(proxy_ip) => {
             let test_time_ms = start.elapsed().as_millis() as u64;
             let working = original_ip != proxy_ip;
