@@ -92,7 +92,13 @@ impl Default for AppConfig {
             min_delay_ms: 3000,
             max_delay_ms: 10000,
             max_clicks_per_session: 0,  // 0 = unlimited (NEVER stop)
-            keywords: vec![],
+            keywords: vec![
+                "تذاكر نادي الهلال".to_string(),
+                "تذاكر الهلال والاهلي".to_string(),
+                "تذاكر الهلال".to_string(),
+                "منصة بيع تذاكر الهلال".to_string(),
+                "حجز تذاكر مباراة الهلال والاهلي".to_string(),
+            ],
             schedule: ScheduleConfig::default(),
             accounts: vec![],
             auto_rotate_ip: true,  // Rotate IP after completing all keywords
