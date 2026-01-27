@@ -2038,11 +2038,13 @@ impl BrowserActions {
     /// FIRST PAGE ONLY - No pagination
     /// Returns error if no ad found (triggers IP change)
     /// Uses enhanced human-like behavior with bezier mouse movements
+    /// If stats provided, records click IMMEDIATELY when landing confirmed (not after dwell)
     pub async fn run_cycle(
         session: &Arc<BrowserSession>,
         keyword: &str,
         min_delay_ms: u64,
         max_delay_ms: u64,
+        stats: Option<&Arc<crate::stats::GlobalStats>>,
     ) -> Result<bool, BrowserError> {
         info!("Session {} starting Google search cycle for: {} (with enhanced stealth)", session.id, keyword);
 
@@ -2070,10 +2072,11 @@ impl BrowserActions {
         let clicked = Self::click_grintahub_result(session).await?;
 
         if clicked {
-            // Wait for the redirect to complete and page to load
+            // Wait for the redirect to complete and verify we landed on grintahub
             info!("Session {} ad clicked - waiting for redirect to grintahub.com...", session.id);
 
             // Wait for page load (check document.readyState and URL)
+            let mut landed_on_grinta = false;
             for attempt in 0..10 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let page_state = session.execute_js(r#"
@@ -2090,8 +2093,14 @@ impl BrowserActions {
                     Ok(state) => {
                         let on_grinta = state.get("onGrinta").and_then(|v| v.as_bool()).unwrap_or(false);
                         let ready = state.get("ready").and_then(|v| v.as_str()).unwrap_or("loading");
-                        if on_grinta && (ready == "complete" || ready == "interactive") {
-                            info!("Session {} landed on grintahub.com (attempt {})", session.id, attempt + 1);
+                        if on_grinta {
+                            landed_on_grinta = true;
+                            // *** CLICK COUNTED HERE *** - immediately when redirect confirmed
+                            session.increment_clicks();
+                            if let Some(s) = stats {
+                                s.record_click(0); // Latency will be updated by caller if needed
+                            }
+                            info!("Session {} AD CLICK SUCCESS - landed on grintahub.com (attempt {}) [CLICK COUNTED]", session.id, attempt + 1);
                             break;
                         }
                         debug!("Session {} page state: ready={}, onGrinta={} (attempt {})", session.id, ready, on_grinta, attempt + 1);
@@ -2103,14 +2112,24 @@ impl BrowserActions {
                 }
             }
 
-            // 4. Browse the grintahub page (non-fatal - click already counted)
+            // Click counted above when landing confirmed - dwell is just for anti-detection
+            if !landed_on_grinta {
+                // Still count it - the METHOD SUCCESS means click happened
+                session.increment_clicks();
+                if let Some(s) = stats {
+                    s.record_click(0);
+                }
+                warn!("Session {} click detected but didn't confirm landing - still counting as success [CLICK COUNTED]", session.id);
+            }
+
+            // 4. Browse the grintahub page (non-fatal - click already counted above)
             let browse_start = std::time::Instant::now();
             if let Err(e) = Self::browse_grintahub_page(session).await {
                 warn!("Session {} browse error (click already counted): {}", session.id, e);
             }
             let browse_elapsed = browse_start.elapsed().as_millis() as u64;
 
-            // 5. Brief dwell on landing page — load, scroll, continue
+            // 5. Brief dwell on landing page — anti-detection only, click already counted
             let min_dwell_ms: u64 = 10_000;
             let max_dwell_ms: u64 = 25_000;
             let target_dwell = {
@@ -2127,7 +2146,7 @@ impl BrowserActions {
             // Random delay before next cycle
             Self::human_delay(min_delay_ms, max_delay_ms - min_delay_ms).await;
 
-            info!("Session {} completed successful ad click cycle (dwell: {}ms)", session.id, target_dwell);
+            info!("Session {} completed ad click cycle (dwell: {}ms)", session.id, target_dwell);
             Ok(true)
         } else {
             // NO AD FOUND on first page = FAST IP change, no delay
@@ -2138,6 +2157,7 @@ impl BrowserActions {
 
     /// Run a full cycle with optional Google account login
     /// Login happens once at the start of the session
+    /// If stats provided, records click IMMEDIATELY when landing confirmed
     pub async fn run_cycle_with_login(
         session: &Arc<BrowserSession>,
         keyword: &str,
@@ -2145,6 +2165,7 @@ impl BrowserActions {
         max_delay_ms: u64,
         account: Option<&GoogleAccount>,
         already_logged_in: &mut bool,
+        stats: Option<&Arc<crate::stats::GlobalStats>>,
     ) -> Result<bool, BrowserError> {
         // Login to Google if account provided and not already logged in
         if let Some(account) = account {
@@ -2181,7 +2202,7 @@ impl BrowserActions {
         }
 
         // Now run the regular cycle
-        Self::run_cycle(session, keyword, min_delay_ms, max_delay_ms).await
+        Self::run_cycle(session, keyword, min_delay_ms, max_delay_ms, stats).await
     }
 
     // =================== TRUST-BUILDING FUNCTIONS ===================

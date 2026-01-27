@@ -303,7 +303,10 @@ impl BrowserSession {
         let mut builder = BrowserConfig::builder();
 
         // Set headless mode
-        if !config.headless {
+        if config.headless {
+            // Modern Chrome requires --headless=new for proper headless
+            builder = builder.arg(("headless", "new"));
+        } else {
             builder = builder.with_head();
         }
 

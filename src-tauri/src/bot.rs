@@ -880,6 +880,7 @@ async fn run_session_loop(
         keyword_index += 1;
 
         let cycle_start = std::time::Instant::now();
+        let clicks_before = session.click_count();
         match BrowserActions::run_cycle_with_login(
             &session,
             keyword,
@@ -887,12 +888,14 @@ async fn run_session_loop(
             rate_limiter.config().max_delay_ms,
             google_account.as_ref(),
             &mut already_logged_in,
+            Some(&stats), // Pass stats so click is counted IMMEDIATELY when redirect confirmed
         ).await {
             Ok(clicked) => {
-                let latency = cycle_start.elapsed().as_millis() as u64;
-                if clicked {
-                    stats.record_click(latency);
-                    session.increment_clicks();
+                // Click already counted inside run_cycle when redirect confirmed
+                // Just update local tracking here
+                let clicks_after = session.click_count();
+                if clicked || clicks_after > clicks_before {
+                    // stats.record_click() already called inside run_cycle
                     rate_limiter.record_success();
                     session_clicks += 1;
                     consecutive_errors = 0;
