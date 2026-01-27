@@ -215,20 +215,90 @@
         makeNative(AudioBuffer.prototype.getChannelData, 'getChannelData');
     } catch(e) {}
 
-    // === 11. WebGL Renderer Fix for Linux ===
-    // ChaserProfile sets Direct3D11 renderer (Windows-only). Override with Linux OpenGL strings.
+    // === 11. WebGL Complete Fingerprint Spoofing ===
+    // Comprehensive WebGL spoofing to hide VNC/software rendering detection
     try {
         const spoofWebGL = (proto) => {
+            // Spoof getParameter
             const getParameter = proto.getParameter;
             proto.getParameter = function(parameter) {
                 // UNMASKED_VENDOR_WEBGL
                 if (parameter === 37445) return 'Google Inc. (NVIDIA Corporation)';
-                // UNMASKED_RENDERER_WEBGL — Linux uses OpenGL, NOT Direct3D
-                if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER OpenGL ES 3.2 NVIDIA 550.120)';
+                // UNMASKED_RENDERER_WEBGL — realistic NVIDIA renderer
+                if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER (0x000021C4) Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                // MAX_TEXTURE_SIZE - match real GPU
+                if (parameter === 3379) return 16384;
+                // MAX_RENDERBUFFER_SIZE
+                if (parameter === 34024) return 16384;
+                // MAX_VIEWPORT_DIMS
+                if (parameter === 3386) return new Int32Array([32767, 32767]);
+                // MAX_VERTEX_ATTRIBS
+                if (parameter === 34921) return 16;
+                // MAX_VERTEX_UNIFORM_VECTORS
+                if (parameter === 36347) return 4096;
+                // MAX_FRAGMENT_UNIFORM_VECTORS
+                if (parameter === 36349) return 1024;
+                // MAX_VARYING_VECTORS
+                if (parameter === 36348) return 30;
+                // ALIASED_LINE_WIDTH_RANGE
+                if (parameter === 33902) return new Float32Array([1, 1]);
+                // ALIASED_POINT_SIZE_RANGE
+                if (parameter === 33901) return new Float32Array([1, 1024]);
                 return getParameter.apply(this, arguments);
             };
             makeNative(proto.getParameter, 'getParameter');
+
+            // Spoof getShaderPrecisionFormat - critical for fingerprinting
+            const getShaderPrecisionFormat = proto.getShaderPrecisionFormat;
+            proto.getShaderPrecisionFormat = function(shaderType, precisionType) {
+                // Return consistent values matching real NVIDIA GPU
+                return {
+                    rangeMin: 127,
+                    rangeMax: 127,
+                    precision: 23
+                };
+            };
+            makeNative(proto.getShaderPrecisionFormat, 'getShaderPrecisionFormat');
+
+            // Spoof getSupportedExtensions - return realistic extension list
+            const getSupportedExtensions = proto.getSupportedExtensions;
+            proto.getSupportedExtensions = function() {
+                return [
+                    'ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_color_buffer_half_float',
+                    'EXT_disjoint_timer_query', 'EXT_float_blend', 'EXT_frag_depth',
+                    'EXT_shader_texture_lod', 'EXT_texture_compression_bptc',
+                    'EXT_texture_compression_rgtc', 'EXT_texture_filter_anisotropic',
+                    'EXT_sRGB', 'KHR_parallel_shader_compile', 'OES_element_index_uint',
+                    'OES_fbo_render_mipmap', 'OES_standard_derivatives', 'OES_texture_float',
+                    'OES_texture_float_linear', 'OES_texture_half_float',
+                    'OES_texture_half_float_linear', 'OES_vertex_array_object',
+                    'WEBGL_color_buffer_float', 'WEBGL_compressed_texture_s3tc',
+                    'WEBGL_compressed_texture_s3tc_srgb', 'WEBGL_debug_renderer_info',
+                    'WEBGL_debug_shaders', 'WEBGL_depth_texture', 'WEBGL_draw_buffers',
+                    'WEBGL_lose_context', 'WEBGL_multi_draw'
+                ];
+            };
+            makeNative(proto.getSupportedExtensions, 'getSupportedExtensions');
+
+            // Spoof getContextAttributes
+            const getContextAttributes = proto.getContextAttributes;
+            proto.getContextAttributes = function() {
+                return {
+                    alpha: true,
+                    antialias: true,
+                    depth: true,
+                    desynchronized: false,
+                    failIfMajorPerformanceCaveat: false,
+                    powerPreference: 'default',
+                    premultipliedAlpha: true,
+                    preserveDrawingBuffer: false,
+                    stencil: false,
+                    xrCompatible: false
+                };
+            };
+            makeNative(proto.getContextAttributes, 'getContextAttributes');
         };
+
         spoofWebGL(WebGLRenderingContext.prototype);
         if (typeof WebGL2RenderingContext !== 'undefined') {
             spoofWebGL(WebGL2RenderingContext.prototype);
