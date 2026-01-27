@@ -1113,18 +1113,69 @@ impl BrowserActions {
                 document.querySelectorAll('[data-grinta-ad-target]').forEach(el => el.removeAttribute('data-grinta-ad-target'));
 
                 // ===== Step 1: Find ALL grintahub links on the page =====
+                // Pass 1: Links with "grintahub" directly in href (organic results)
                 const allGrintaLinks = [];
+                const seen = new Set(); // track by element reference
                 const allLinks = document.querySelectorAll('a[href]');
                 for (const link of allLinks) {
                     const href = link.getAttribute('href') || '';
                     if ((href.includes('grintahub.com') || href.includes('grintahub')) &&
                         !href.includes('google.com') && !href.includes('google.co')) {
                         allGrintaLinks.push(link);
+                        seen.add(link);
+                    }
+                }
+
+                // Pass 2: Google Ad links that REDIRECT to grintahub
+                // Ad links use googleadservices.com/pagead/aclk?... as href
+                // The "grintahub.com" text is in a sibling <cite> or display URL element
+                // We find ad blocks that mention "grintahub" and collect ALL their links
+                const adContainers = document.querySelectorAll('#tads, #tadsb, #bottomads');
+                let pass2Count = 0;
+                for (const container of adContainers) {
+                    // Find individual ad blocks within the container
+                    // Each ad is typically a div with data-dtld or data-text-ad, or a direct child block
+                    const adBlocks = container.querySelectorAll('[data-dtld], [data-text-ad], .uEierd, .x54gtf');
+                    const blocksToCheck = adBlocks.length > 0 ? adBlocks : [container];
+                    for (const block of blocksToCheck) {
+                        // Check if this ad block is for grintahub
+                        const dtld = block.getAttribute('data-dtld') || '';
+                        const blockText = (block.innerText || '').toLowerCase();
+                        const citeEls = block.querySelectorAll('cite, .qzEoUe, .NJjxre, [data-dtld]');
+                        let mentionsGrinta = dtld.includes('grintahub');
+                        if (!mentionsGrinta) {
+                            for (const cite of citeEls) {
+                                if ((cite.textContent || '').toLowerCase().includes('grintahub')) {
+                                    mentionsGrinta = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!mentionsGrinta) {
+                            mentionsGrinta = blockText.includes('grintahub');
+                        }
+
+                        if (mentionsGrinta) {
+                            // This ad block is for grintahub — collect ALL its <a> links
+                            const blockLinks = block.querySelectorAll('a[href]');
+                            for (const link of blockLinks) {
+                                if (!seen.has(link)) {
+                                    allGrintaLinks.push(link);
+                                    seen.add(link);
+                                    pass2Count++;
+                                }
+                            }
+                        }
                     }
                 }
 
                 if (allGrintaLinks.length === 0) {
-                    return { clicked: false, count: 0, debug: { reason: 'no_grintahub_links_on_page' } };
+                    return { clicked: false, count: 0, debug: {
+                        reason: 'no_grintahub_links_on_page',
+                        hasTopAds: !!document.querySelector('#tads'),
+                        hasBottomAds: !!document.querySelector('#tadsb, #bottomads'),
+                        adContainerCount: adContainers.length
+                    }};
                 }
 
                 // ===== Step 2: Classify each link as AD or ORGANIC =====
@@ -1250,6 +1301,7 @@ impl BrowserActions {
                     totalGrintaLinks: allGrintaLinks.length,
                     adLinksFound: adLinks.length,
                     organicLinksFound: organicLinks.length,
+                    adRedirectLinks: pass2Count,
                     hasTopAds: !!document.querySelector('#tads'),
                     hasBottomAds: !!document.querySelector('#tadsb, #bottomads'),
                     pageHasAdLabel: bodyText.includes('نتيجة إعلانية') || bodyText.includes('إعلان') || bodyText.includes('Sponsored'),
@@ -1280,10 +1332,14 @@ impl BrowserActions {
                     finalRect = chosen.el.getBoundingClientRect();
                 }
 
-                // Final safety check — clamp to viewport
+                // Randomized click position within the link (humans don't click exact center)
+                // Use gaussian-like distribution: mostly near center but with natural variance
                 const vpH = window.innerHeight;
-                const clickY = Math.min(Math.max(finalRect.top + finalRect.height / 2, 10), vpH - 10);
-                const clickX = Math.min(Math.max(finalRect.left + finalRect.width / 2, 10), window.innerWidth - 10);
+                const randOffset = () => (Math.random() + Math.random() + Math.random()) / 3; // pseudo-gaussian 0-1
+                const rawX = finalRect.left + finalRect.width * (0.2 + randOffset() * 0.6); // 20%-80% of width
+                const rawY = finalRect.top + finalRect.height * (0.25 + randOffset() * 0.5); // 25%-75% of height
+                const clickX = Math.min(Math.max(rawX, 10), window.innerWidth - 10);
+                const clickY = Math.min(Math.max(rawY, 10), vpH - 10);
 
                 return {
                     clicked: false,
@@ -1301,9 +1357,9 @@ impl BrowserActions {
         "#).await
     }
 
-    /// Perform CDP mouse movement + click on an ad, then VERIFY navigation happened.
-    /// If CDP click doesn't navigate, tries JS click and then direct navigation as fallbacks.
-    /// Returns true if click was performed (any method), false if result didn't have coordinates.
+    /// Perform click on an ad using MULTIPLE methods until one works.
+    /// Tries 7 different click strategies — from most natural (CDP) to most reliable (direct nav).
+    /// Returns true if any method navigated away from the search page.
     async fn cdp_click_ad(session: &Arc<BrowserSession>, result: &serde_json::Value, phase: &str) -> Result<bool, BrowserError> {
         let ready = result.get("ready_for_cdp_click").and_then(|v| v.as_bool()).unwrap_or(false);
         if !ready {
@@ -1324,86 +1380,137 @@ impl BrowserActions {
         let url_before = session.execute_js("window.location.href").await
             .ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
 
-        // === METHOD 1: CDP mouse movement + click (isTrusted: true) ===
-        session.move_mouse_human(x, y).await.ok();
-        Self::random_delay(150, 300).await;
-        session.click_human_at(x, y).await?;
-        info!("Session {} CDP click sent at ({:.0}, {:.0})", session.id, x, y);
-
-        // Wait for navigation — poll readyState + URL change instead of blind sleep
-        let mut url_after_cdp = String::new();
-        let mut cdp_navigated = false;
-        for poll in 0..12 {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            let state = session.execute_js(r#"
-                ({ url: window.location.href, ready: document.readyState })
-            "#).await;
-            if let Ok(s) = &state {
-                let url = s.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                let ready = s.get("ready").and_then(|v| v.as_str()).unwrap_or("loading");
-                if url != url_before && !url.is_empty() && (ready == "complete" || ready == "interactive") {
-                    url_after_cdp = url.to_string();
-                    cdp_navigated = true;
-                    debug!("Session {} CDP navigation settled (poll {})", session.id, poll + 1);
-                    break;
-                }
-                // URL changed but page still loading — keep waiting
-                if url != url_before && !url.is_empty() {
-                    url_after_cdp = url.to_string();
+        // Helper: poll for navigation (URL change + readyState)
+        async fn poll_navigation(session: &Arc<BrowserSession>, url_before: &str, max_polls: u32) -> (bool, String, bool) {
+            let mut url_after = String::new();
+            let mut navigated = false;
+            for poll in 0..max_polls {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let state = session.execute_js(r#"
+                    ({ url: window.location.href, ready: document.readyState })
+                "#).await;
+                if let Ok(s) = &state {
+                    let url = s.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    let ready = s.get("ready").and_then(|v| v.as_str()).unwrap_or("loading");
+                    if url != url_before && !url.is_empty() && (ready == "complete" || ready == "interactive") {
+                        url_after = url.to_string();
+                        navigated = true;
+                        debug!("Navigation settled (poll {})", poll + 1);
+                        break;
+                    }
+                    if url != url_before && !url.is_empty() {
+                        url_after = url.to_string();
+                    }
                 }
             }
-        }
-        // If URL changed but readyState never reached complete, still use it
-        if !cdp_navigated && !url_after_cdp.is_empty() && url_after_cdp != url_before {
-            cdp_navigated = true;
-        }
-
-        let is_error_page = url_after_cdp.starts_with("chrome-error://")
-            || url_after_cdp.starts_with("about:")
-            || url_after_cdp.starts_with("chrome://");
-
-        if cdp_navigated && !is_error_page {
-            info!("Session {} CDP click navigated! {} -> {}", session.id,
-                safe_truncate(&url_before, 60), safe_truncate(&url_after_cdp, 80));
-            return Ok(true);
+            if !navigated && !url_after.is_empty() && url_after != url_before {
+                navigated = true;
+            }
+            let is_error = url_after.starts_with("chrome-error://")
+                || url_after.starts_with("about:")
+                || url_after.starts_with("chrome://");
+            (navigated, url_after, is_error)
         }
 
-        if is_error_page {
-            warn!("Session {} CDP click went to error page: {} — trying JS click", session.id, safe_truncate(&url_after_cdp, 60));
-            // Go back to search page for JS fallback
+        // Helper: go back to search page after error
+        async fn go_back(session: &Arc<BrowserSession>) {
             session.execute_js("window.history.back()").await.ok();
             tokio::time::sleep(Duration::from_millis(2000)).await;
         }
 
-        warn!("Session {} CDP click did NOT navigate (still on: {}), trying JS click...",
-            session.id, safe_truncate(&url_before, 60));
+        // ================================================================
+        // METHOD 1: CDP mouse hover + bezier click (isTrusted: true)
+        // ================================================================
+        info!("Session {} METHOD 1: CDP hover + bezier click", session.id);
+        {
+            let (scan_x, scan_y) = {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                (x + rng.gen_range(-80.0..80.0_f64), (y - rng.gen_range(60.0..140.0_f64)).max(10.0))
+            };
+            session.move_mouse_human(scan_x, scan_y).await.ok();
+            Self::random_delay(300, 600).await;
+            session.move_mouse_human(x, y).await.ok();
+            Self::random_delay(600, 900).await;
+        }
+        session.click_human_at(x, y).await?;
 
-        // === METHOD 2: JS click — find the marked element via data attribute ===
+        let (nav, url_after, is_err) = poll_navigation(session, &url_before, 12).await;
+        if nav && !is_err {
+            info!("Session {} METHOD 1 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+            return Ok(true);
+        }
+        if is_err { go_back(session).await; }
+
+        // ================================================================
+        // METHOD 2: CDP click at FRESH coordinates (element may have shifted)
+        // ================================================================
+        warn!("Session {} METHOD 1 failed, trying METHOD 2: CDP fresh-coord click", session.id);
+        let fresh_coords = session.execute_js(r#"
+            (function() {
+                let link = document.querySelector('a[data-grinta-ad-target="true"]');
+                if (!link) return null;
+                link.scrollIntoView({ behavior: 'instant', block: 'center' });
+                const r = link.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return null;
+                const rx = () => (Math.random() + Math.random() + Math.random()) / 3;
+                return {
+                    x: Math.min(Math.max(r.left + r.width * (0.2 + rx() * 0.6), 10), window.innerWidth - 10),
+                    y: Math.min(Math.max(r.top + r.height * (0.25 + rx() * 0.5), 10), window.innerHeight - 10)
+                };
+            })()
+        "#).await.ok();
+
+        if let Some(ref coords) = fresh_coords {
+            if !coords.is_null() {
+                let fx = coords.get("x").and_then(|v| v.as_f64()).unwrap_or(x);
+                let fy = coords.get("y").and_then(|v| v.as_f64()).unwrap_or(y);
+                Self::random_delay(200, 400).await;
+                session.click_human_at(fx, fy).await?;
+
+                let (nav, url_after, is_err) = poll_navigation(session, &url_before, 10).await;
+                if nav && !is_err {
+                    info!("Session {} METHOD 2 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+                    return Ok(true);
+                }
+                if is_err { go_back(session).await; }
+            }
+        }
+
+        // ================================================================
+        // METHOD 3: JS full mouse event sequence + native .click()
+        // ================================================================
+        warn!("Session {} METHOD 2 failed, trying METHOD 3: JS mouse events + .click()", session.id);
         let js_result = session.execute_js(r#"
             (async function() {
-                // Find the element we marked with data-grinta-ad-target
                 let link = document.querySelector('a[data-grinta-ad-target="true"]');
                 if (!link) {
-                    // Fallback: find any grintahub link in ad container
-                    const allLinks = document.querySelectorAll('#tads a[href], [data-text-ad] a[href], [data-dtld] a[href]');
-                    for (const l of allLinks) {
-                        const h = l.getAttribute('href') || '';
-                        if (h.includes('grintahub')) { link = l; break; }
+                    const containers = document.querySelectorAll('#tads, #tadsb, #bottomads');
+                    for (const c of containers) {
+                        const blocks = c.querySelectorAll('[data-dtld], [data-text-ad], .uEierd');
+                        const toCheck = blocks.length > 0 ? blocks : [c];
+                        for (const block of toCheck) {
+                            const dtld = block.getAttribute('data-dtld') || '';
+                            const txt = (block.innerText || '').toLowerCase();
+                            const cites = block.querySelectorAll('cite');
+                            let found = dtld.includes('grintahub') || txt.includes('grintahub');
+                            if (!found) { for (const ci of cites) { if ((ci.textContent||'').includes('grintahub')) { found = true; break; } } }
+                            if (found) { link = block.querySelector('a[href]'); if (link) break; }
+                        }
+                        if (link) break;
                     }
                 }
                 if (!link) return { clicked: false, reason: 'element_not_found' };
 
                 link.removeAttribute('target');
                 link.setAttribute('target', '_self');
-
-                // Scroll into view and get coordinates
                 link.scrollIntoView({ behavior: 'instant', block: 'center' });
                 await new Promise(r => setTimeout(r, 200));
                 const rect = link.getBoundingClientRect();
                 const cx = rect.left + rect.width / 2;
                 const cy = rect.top + rect.height / 2;
 
-                // Dispatch full mouse event sequence (mouseenter → mouseover → mousedown → mouseup → click)
+                // Full mouse event sequence
                 const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
                 link.dispatchEvent(new MouseEvent('mouseenter', opts));
                 link.dispatchEvent(new MouseEvent('mouseover', opts));
@@ -1414,7 +1521,7 @@ impl BrowserActions {
                 await new Promise(r => setTimeout(r, 10));
                 link.dispatchEvent(new MouseEvent('click', { ...opts, button: 0 }));
 
-                // Also try native .click() as backup
+                // Also try native .click()
                 await new Promise(r => setTimeout(r, 100));
                 link.click();
 
@@ -1427,94 +1534,151 @@ impl BrowserActions {
             .and_then(|v| v.as_bool()).unwrap_or(false);
 
         if js_clicked {
-            // Wait for navigation — poll readyState + URL change
-            let mut url_after_js = String::new();
-            let mut js_navigated = false;
-            for _poll in 0..12 {
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                let state = session.execute_js(r#"
-                    ({ url: window.location.href, ready: document.readyState })
-                "#).await;
-                if let Ok(s) = &state {
-                    let url = s.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                    let ready = s.get("ready").and_then(|v| v.as_str()).unwrap_or("loading");
-                    if url != url_before && !url.is_empty() && (ready == "complete" || ready == "interactive") {
-                        url_after_js = url.to_string();
-                        js_navigated = true;
-                        break;
-                    }
-                    if url != url_before && !url.is_empty() {
-                        url_after_js = url.to_string();
-                    }
-                }
-            }
-            if !js_navigated && !url_after_js.is_empty() && url_after_js != url_before {
-                js_navigated = true;
-            }
-
-            let js_is_error = url_after_js.starts_with("chrome-error://")
-                || url_after_js.starts_with("about:")
-                || url_after_js.starts_with("chrome://");
-
-            if js_navigated && !js_is_error {
-                info!("Session {} JS click navigated! -> {}", session.id, safe_truncate(&url_after_js, 80));
+            let (nav, url_after, is_err) = poll_navigation(session, &url_before, 10).await;
+            if nav && !is_err {
+                info!("Session {} METHOD 3 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
                 return Ok(true);
             }
-            if js_is_error {
-                warn!("Session {} JS click went to error page: {}", session.id, safe_truncate(&url_after_js, 60));
-                session.execute_js("window.history.back()").await.ok();
-                tokio::time::sleep(Duration::from_millis(2000)).await;
-            } else {
-                warn!("Session {} JS click did NOT navigate either", session.id);
-            }
+            if is_err { go_back(session).await; }
         } else {
             let reason = js_result.as_ref()
                 .and_then(|v| v.get("reason"))
                 .and_then(|v| v.as_str()).unwrap_or("unknown");
-            warn!("Session {} JS click failed: {}", session.id, reason);
+            warn!("Session {} METHOD 3 element not found: {}", session.id, reason);
         }
 
-        // === METHOD 3: Direct navigation to the ad href as last resort ===
-        // This goes through the Google Ad redirect URL so tracking still works
-        if !href.is_empty() {
-            warn!("Session {} direct navigation to ad URL: {}", session.id, safe_truncate(href, 100));
-            let nav_result = session.navigate(href).await;
+        // ================================================================
+        // METHOD 4: Focus element + CDP Enter keypress
+        // ================================================================
+        warn!("Session {} METHOD 3 failed, trying METHOD 4: Focus + Enter key", session.id);
+        let focus_result = session.execute_js(r#"
+            (function() {
+                let link = document.querySelector('a[data-grinta-ad-target="true"]');
+                if (!link) {
+                    const containers = document.querySelectorAll('#tads, #tadsb, #bottomads');
+                    for (const c of containers) {
+                        const blocks = c.querySelectorAll('[data-dtld], [data-text-ad], .uEierd');
+                        const toCheck = blocks.length > 0 ? blocks : [c];
+                        for (const block of toCheck) {
+                            const dtld = block.getAttribute('data-dtld') || '';
+                            const txt = (block.innerText || '').toLowerCase();
+                            let found = dtld.includes('grintahub') || txt.includes('grintahub');
+                            if (found) { link = block.querySelector('a[href]'); if (link) break; }
+                        }
+                        if (link) break;
+                    }
+                }
+                if (!link) return { focused: false };
+                link.removeAttribute('target');
+                link.setAttribute('target', '_self');
+                link.focus();
+                return { focused: true, href: link.getAttribute('href') || '' };
+            })()
+        "#).await.ok();
+
+        let focused = focus_result.as_ref()
+            .and_then(|v| v.get("focused"))
+            .and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if focused {
+            // Send Enter keypress via CDP
+            Self::random_delay(100, 300).await;
+            session.execute_js(r#"
+                document.activeElement && document.activeElement.dispatchEvent(
+                    new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true })
+                );
+                document.activeElement && document.activeElement.dispatchEvent(
+                    new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true })
+                );
+                document.activeElement && document.activeElement.dispatchEvent(
+                    new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true })
+                );
+            "#).await.ok();
+
+            let (nav, url_after, is_err) = poll_navigation(session, &url_before, 10).await;
+            if nav && !is_err {
+                info!("Session {} METHOD 4 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+                return Ok(true);
+            }
+            if is_err { go_back(session).await; }
+        }
+
+        // ================================================================
+        // METHOD 5: JS window.location.href = ad URL
+        // ================================================================
+        let ad_href = focus_result.as_ref()
+            .and_then(|v| v.get("href"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(href);
+
+        if !ad_href.is_empty() {
+            warn!("Session {} METHOD 4 failed, trying METHOD 5: window.location.href", session.id);
+            session.execute_js(&format!(
+                "window.location.href = {};",
+                serde_json::to_string(ad_href).unwrap_or_else(|_| format!("\"{}\"", ad_href))
+            )).await.ok();
+
+            let (nav, url_after, is_err) = poll_navigation(session, &url_before, 12).await;
+            if nav && !is_err {
+                info!("Session {} METHOD 5 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+                return Ok(true);
+            }
+            if is_err { go_back(session).await; }
+        }
+
+        // ================================================================
+        // METHOD 6: Create hidden anchor + .click() (bypasses event listeners)
+        // ================================================================
+        if !ad_href.is_empty() {
+            warn!("Session {} METHOD 5 failed, trying METHOD 6: anchor clone click", session.id);
+            let href_json = serde_json::to_string(ad_href).unwrap_or_else(|_| format!("\"{}\"", ad_href));
+            session.execute_js(&format!(r#"
+                (function() {{
+                    var a = document.createElement('a');
+                    a.href = {};
+                    a.target = '_self';
+                    a.style.position = 'fixed';
+                    a.style.top = '-9999px';
+                    a.textContent = 'nav';
+                    document.body.appendChild(a);
+                    a.click();
+                    setTimeout(function() {{ a.remove(); }}, 500);
+                }})()
+            "#, href_json)).await.ok();
+
+            let (nav, url_after, is_err) = poll_navigation(session, &url_before, 12).await;
+            if nav && !is_err {
+                info!("Session {} METHOD 6 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+                return Ok(true);
+            }
+            if is_err { go_back(session).await; }
+        }
+
+        // ================================================================
+        // METHOD 7: Direct navigation via session.navigate() (last resort)
+        // ================================================================
+        if !ad_href.is_empty() {
+            warn!("Session {} METHOD 6 failed, trying METHOD 7: direct navigate()", session.id);
+            let nav_result = session.navigate(ad_href).await;
             match nav_result {
                 Ok(_) => {
-                    // Wait for navigation — poll readyState instead of blind sleep
-                    let mut final_url = String::new();
-                    for poll in 0..12 {
-                        tokio::time::sleep(Duration::from_millis(400)).await;
-                        let state = session.execute_js(r#"
-                            ({ url: window.location.href, ready: document.readyState })
-                        "#).await;
-                        if let Ok(s) = &state {
-                            let url = s.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                            let ready = s.get("ready").and_then(|v| v.as_str()).unwrap_or("loading");
-                            final_url = url.to_string();
-                            if !url.is_empty() && (ready == "complete" || ready == "interactive") {
-                                debug!("Session {} direct nav settled (poll {})", session.id, poll + 1);
-                                break;
-                            }
-                        }
-                    }
-                    let nav_is_error = final_url.starts_with("chrome-error://")
-                        || final_url.starts_with("about:")
-                        || final_url.starts_with("chrome://");
-                    if !nav_is_error {
-                        info!("Session {} direct navigation landed on: {}", session.id, safe_truncate(&final_url, 80));
+                    let (nav, url_after, is_err) = poll_navigation(session, &url_before, 12).await;
+                    if nav && !is_err {
+                        info!("Session {} METHOD 7 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
                         return Ok(true);
                     }
-                    warn!("Session {} direct navigation error page: {}", session.id, safe_truncate(&final_url, 60));
+                    if is_err {
+                        warn!("Session {} METHOD 7 error page: {}", session.id, safe_truncate(&url_after, 60));
+                    }
                 }
                 Err(e) => {
-                    warn!("Session {} direct navigation failed: {}", session.id, e);
+                    warn!("Session {} METHOD 7 navigate() error: {}", session.id, e);
                 }
             }
         }
 
-        // All methods failed — don't count as click
-        warn!("Session {} ALL click methods failed — ad not clicked", session.id);
+        // All 7 methods failed
+        warn!("Session {} ALL 7 click methods failed — ad not clicked", session.id);
         Ok(false)
     }
 
@@ -1528,17 +1692,29 @@ impl BrowserActions {
         // Brief pause to "read" results like a human
         Self::random_delay(800, 1200).await;
 
+        // Move cursor into the results area (human brings hand to mouse/trackpad)
+        {
+            let (scan_x, scan_y) = {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                (rng.gen_range(200.0..600.0_f64), rng.gen_range(150.0..350.0_f64))
+            };
+            session.move_mouse_human(scan_x, scan_y).await.ok();
+            Self::random_delay(200, 400).await;
+        }
+
         // ========== PHASE 1: Scan from top of page ==========
         let result = Self::find_and_click_grintahub_ad(session).await?;
         let debug_info = result.get("debug").cloned().unwrap_or_default();
         let ad_count = debug_info.get("adLinksFound").and_then(|v| v.as_u64()).unwrap_or(0);
         let organic_count = debug_info.get("organicLinksFound").and_then(|v| v.as_u64()).unwrap_or(0);
         let total_grinta = debug_info.get("totalGrintaLinks").and_then(|v| v.as_u64()).unwrap_or(0);
+        let redirect_count = debug_info.get("adRedirectLinks").and_then(|v| v.as_u64()).unwrap_or(0);
         let has_ad_label = debug_info.get("pageHasAdLabel").and_then(|v| v.as_bool()).unwrap_or(false);
         let ad_types = debug_info.get("adTypes").and_then(|v| v.as_str()).unwrap_or("");
 
-        info!("Session {} scan: {} grintahub links ({} ads, {} organic), adLabel={}, types=[{}]",
-            session.id, total_grinta, ad_count, organic_count, has_ad_label, safe_truncate(ad_types, 100));
+        info!("Session {} scan: {} grintahub links ({} ads [{}via redirect], {} organic), adLabel={}, types=[{}]",
+            session.id, total_grinta, ad_count, redirect_count, organic_count, has_ad_label, safe_truncate(ad_types, 100));
 
         if Self::cdp_click_ad(session, &result, "initial scan").await? {
             return Ok(true);

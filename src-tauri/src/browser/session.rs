@@ -12,11 +12,20 @@ use chaser_oxide::{Browser, BrowserConfig, Page};
 use chaser_oxide::chaser::ChaserPage;
 use chaser_oxide::profiles::{ChaserProfile, Gpu};
 use futures::StreamExt;
-use uuid::Uuid;
 use rand::Rng;
+
+use std::sync::atomic::AtomicU32;
 
 use super::BrowserError;
 use crate::proxy::LocalProxyForwarder;
+
+/// Global counter for sequential bot naming (Bot-1, Bot-2, ...)
+static BOT_COUNTER: AtomicU32 = AtomicU32::new(1);
+
+/// Reset the bot counter back to 1 (call when all sessions are closed)
+pub fn reset_bot_counter() {
+    BOT_COUNTER.store(1, Ordering::Relaxed);
+}
 
 /// Detect the major Chrome version from the installed binary.
 /// Returns (major_version, full_version_string) e.g. (142, "142.0.7444.175")
@@ -279,7 +288,7 @@ pub struct BrowserSession {
 impl BrowserSession {
     /// Create a new browser session with the given config
     pub async fn new(config: BrowserSessionConfig) -> Result<Self, BrowserError> {
-        let session_id = Uuid::new_v4().to_string()[..8].to_string();
+        let session_id = format!("Bot-{}", BOT_COUNTER.fetch_add(1, Ordering::Relaxed));
 
         info!("Launching browser session {} (headless: {})", session_id, config.headless);
 

@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn, error};
 use uuid::Uuid;
 
-use super::{BrowserSession, BrowserSessionConfig, BrowserError};
+use super::{BrowserSession, BrowserSessionConfig, BrowserError, reset_bot_counter};
 use crate::proxy::GlobalProxyManager;
 
 /// Information about a browser session (for frontend)
@@ -296,12 +296,13 @@ impl BrowserPool {
             }
         }
 
-        // Clear statuses, used IPs, and headless override
+        // Clear statuses, used IPs, headless override, and reset bot counter
         self.statuses.write().await.clear();
         self.used_ips.write().await.clear();
         *self.headless_override.write().await = None;
+        reset_bot_counter();
 
-        info!("All browser sessions closed (used IPs cleared)");
+        info!("All browser sessions closed (used IPs cleared, bot counter reset)");
         Ok(())
     }
 

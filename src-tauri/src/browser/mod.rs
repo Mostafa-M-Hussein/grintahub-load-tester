@@ -8,7 +8,7 @@ mod pool;
 mod actions;
 mod errors;
 
-pub use session::{BrowserSession, BrowserSessionConfig};
+pub use session::{BrowserSession, BrowserSessionConfig, reset_bot_counter};
 pub use pool::{BrowserPool, SessionInfo};
 pub use actions::{BrowserActions, GoogleAccount};
 pub use errors::BrowserError;
