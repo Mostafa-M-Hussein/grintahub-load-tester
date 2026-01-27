@@ -39,11 +39,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize application state
     let state = Arc::new(app_lib::AppState::new());
 
-    // Server mode: force headless since there's no display
+    // Server mode: check for display (Xvfb or real)
+    // If DISPLAY is set, we can use GUI mode (better anti-detection)
+    // If no display, force headless
     {
         let mut config = state.config.write().await;
-        if !config.headless {
-            info!("Server mode: forcing headless=true (no display available)");
+        let has_display = std::env::var("DISPLAY").map(|d| !d.is_empty()).unwrap_or(false);
+
+        if has_display {
+            // Xvfb or real display available - use GUI mode for better anti-detection
+            if config.headless {
+                info!("Server mode: DISPLAY={} detected (Xvfb) - using GUI mode for anti-detection",
+                      std::env::var("DISPLAY").unwrap_or_default());
+                config.headless = false;
+                config.save();
+            } else {
+                info!("Server mode: using GUI mode (DISPLAY={})", std::env::var("DISPLAY").unwrap_or_default());
+            }
+        } else if !config.headless {
+            // No display available - must use headless
+            info!("Server mode: no DISPLAY - forcing headless=true");
             config.headless = true;
             config.save();
         }

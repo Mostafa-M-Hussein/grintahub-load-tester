@@ -363,7 +363,9 @@ impl BrowserSession {
 
             // Other
             .arg("disable-domain-reliability")
-            .arg("disable-component-update");
+            .arg("disable-component-update")
+            // Required when running as root (e.g., in Docker or on VPS)
+            .arg("no-sandbox");
 
         // Load 2Captcha extension via chaser-oxide's builder method
         // IMPORTANT: Must use .extension() not .arg(("load-extension", ...))
