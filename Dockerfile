@@ -15,6 +15,7 @@ WORKDIR /app
 # Copy source
 COPY src-tauri/Cargo.toml src-tauri/Cargo.lock ./
 COPY src-tauri/src ./src
+COPY src-tauri/evasions ./evasions
 
 # Build release binary (server mode, no desktop features)
 RUN cargo build --release --no-default-features --bin server
