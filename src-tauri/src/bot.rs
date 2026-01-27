@@ -852,43 +852,8 @@ async fn run_session_loop(
         }
     };
 
-    // Detect proxy IP via browser navigation (confirms proxy is working)
-    match tokio::time::timeout(
-        Duration::from_secs(15),
-        session.detect_ip()
-    ).await {
-        Ok(Ok(ip)) => {
-            info!("Session {} proxy IP confirmed: {}", session_id, ip);
-        }
-        Ok(Err(e)) => {
-            warn!("Session {} IP detection failed (proxy may still work): {}", session_id, e);
-        }
-        Err(_) => {
-            warn!("Session {} IP detection timed out (proxy may still work)", session_id);
-        }
-    }
-
-    // === WARM-UP PHASE: Build trust before first Google search ===
-    // Visit Google (get cookies), browse 1-2 lightweight sites.
-    // This reduces CAPTCHA triggers by making the session look established.
-    info!("Session {} starting warm-up phase before main loop", session_id);
-    if let Err(e) = BrowserActions::warm_up_session(&session).await {
-        warn!("Session {} warm-up failed (continuing anyway): {}", session_id, e);
-    }
-
-    // Optional: Do one organic search before starting keyword searches (50% chance)
-    if rand::thread_rng().gen_bool(0.5) {
-        info!("Session {} doing initial organic search before target keywords", session_id);
-        match BrowserActions::organic_search(&session).await {
-            Err(BrowserError::CaptchaDetected(_)) => {
-                warn!("Session {} hit CAPTCHA during warm-up organic search — continuing to main loop", session_id);
-            }
-            Err(e) => {
-                debug!("Session {} warm-up organic search failed (non-fatal): {}", session_id, e);
-            }
-            Ok(()) => {}
-        }
-    }
+    // DISABLED: IP detection, warm-up, and organic search — go straight to target keywords
+    // to test if CAPTCHA fix works without trust-building overhead.
 
     let config = rate_config.read().await.clone();
     let mut rate_limiter = crate::rate::RateLimiter::new(config);
@@ -909,25 +874,7 @@ async fn run_session_loop(
         rate_limiter.wait().await;
         session.increment_cycles();
 
-        // === ORGANIC SEARCH MIXING: 25% chance before target search ===
-        // Makes the session look like a real user who does varied searches.
-        if rand::thread_rng().gen_bool(0.25) {
-            debug!("Session {} doing organic search before target keyword", session_id);
-            match BrowserActions::organic_search(&session).await {
-                Err(BrowserError::CaptchaDetected(msg)) => {
-                    warn!("Session {} hit CAPTCHA during organic search: {}", session_id, msg);
-                    // Don't continue to target search — handle CAPTCHA in the normal flow
-                    // by falling through to the next iteration
-                    continue;
-                }
-                Err(e) => {
-                    debug!("Session {} organic search failed (non-fatal): {}", session_id, e);
-                }
-                Ok(()) => {
-                    BrowserActions::human_delay(2000, 2000).await;
-                }
-            }
-        }
+        // DISABLED: organic search mixing — going straight to target keywords for testing
 
         let keyword = &keywords[keyword_index % keywords.len()];
         keyword_index += 1;
@@ -969,6 +916,8 @@ async fn run_session_loop(
 
                                 match pool.get_session(&session_id).await {
                                     Some(s) => {
+                                        // Carry over click count to replacement session
+                                        for _ in 0..session_clicks { s.increment_clicks(); }
                                         session = s;
                                         already_logged_in = false;
                                         tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -989,78 +938,10 @@ async fn run_session_loop(
                 }
             }
             Err(BrowserError::CaptchaDetected(msg)) => {
-                warn!("Session {} CAPTCHA detected: {}", session_id, msg);
-
-                // === 2Captcha BROWSER EXTENSION handles solving ===
-                // The extension auto-detects reCAPTCHA, sends to 2Captcha API,
-                // injects the token, calls submitCallback, and auto-submits.
-                // We just need to wait for it to finish (page leaves /sorry/).
-                let mut solved = false;
-                if !captcha_api_key.is_empty() {
-                    info!("Session {} waiting for 2Captcha browser extension to solve CAPTCHA...", session_id);
-                    session.increment_captchas();
-
-                    // Poll every 5 seconds for up to 120 seconds (typical solve: 20-60s)
-                    let max_wait = 120;
-                    let poll_interval = 5;
-                    for elapsed in (0..max_wait).step_by(poll_interval) {
-                        tokio::time::sleep(Duration::from_secs(poll_interval as u64)).await;
-
-                        if !is_running.load(Ordering::SeqCst) { break; }
-
-                        // Check if page left the CAPTCHA (/sorry/) page
-                        let still_captcha = BrowserActions::check_google_captcha(&session).await.unwrap_or(true);
-                        if !still_captcha {
-                            info!("Session {} CAPTCHA SOLVED by extension after ~{}s! Page redirected to search results.",
-                                session_id, elapsed + poll_interval);
-                            solved = true;
-                            break;
-                        }
-
-                        debug!("Session {} still on CAPTCHA page ({}/{}s)...", session_id, elapsed + poll_interval, max_wait);
-                    }
-                } else {
-                    warn!("Session {} no 2Captcha API key — extension not loaded, skipping solve", session_id);
-                }
-
-                // OLD PROGRAMMATIC SOLVING (commented out — kept as fallback)
-                // if !captcha_api_key.is_empty() {
-                //     info!("Session {} attempting to solve CAPTCHA with 2Captcha API...", session_id);
-                //     match BrowserActions::solve_google_captcha(&session, &captcha_api_key).await {
-                //         Ok(true) => {
-                //             info!("Session {} CAPTCHA solved successfully! Continuing...", session_id);
-                //             solved = true;
-                //             consecutive_errors = 0;
-                //         }
-                //         Ok(false) => {
-                //             warn!("Session {} CAPTCHA solve returned false", session_id);
-                //         }
-                //         Err(e) => {
-                //             warn!("Session {} CAPTCHA solve failed: {}", session_id, e);
-                //         }
-                //     }
-                // }
-
-                if solved {
-                    consecutive_errors = 0;
-                    continue;
-                }
-
-                warn!("Session {} CAPTCHA not solved after 120s - changing IP", session_id);
+                warn!("Session {} CAPTCHA detected: {} — rotating IP immediately (no solving)", session_id, msg);
+                session.increment_captchas();
                 stats.record_error();
-                session.increment_errors();
                 consecutive_errors += 1;
-
-                // IMPORTANT: Exponential backoff before IP rotation.
-                // Rapid IP rotation is itself a strong bot signal for Google.
-                // 10s -> 20s -> 40s -> 80s -> 160s (cap 5min)
-                let captcha_backoff = std::cmp::min(
-                    10_000u64 * 2u64.pow(consecutive_errors.min(5)),
-                    300_000 // Cap at 5 minutes
-                );
-                info!("Session {} waiting {}s before IP rotation (exponential backoff, error #{})",
-                    session_id, captcha_backoff / 1000, consecutive_errors);
-                tokio::time::sleep(Duration::from_millis(captcha_backoff)).await;
 
                 let _ = pool.close_session(&session_id).await;
                 tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -1068,15 +949,16 @@ async fn run_session_loop(
                 match pool.spawn_sessions(1).await {
                     Ok(new_ids) if !new_ids.is_empty() => {
                         let new_id = new_ids.into_iter().next().unwrap();
-                        info!("Session {} -> {} (IP change #{}, reason: CAPTCHA unsolved)",
+                        info!("Session {} -> {} (CAPTCHA, IP change #{})",
                             session_id, new_id, consecutive_errors);
                         session_id = new_id;
 
                         match pool.get_session(&session_id).await {
                             Some(s) => {
+                                // Carry over click count to replacement session
+                                for _ in 0..session_clicks { s.increment_clicks(); }
                                 session = s;
                                 already_logged_in = false;
-                                tokio::time::sleep(Duration::from_millis(500)).await;
                             }
                             None => {
                                 warn!("New session {} not found - retrying spawn", session_id);
@@ -1112,6 +994,8 @@ async fn run_session_loop(
 
                             match pool.get_session(&session_id).await {
                                 Some(s) => {
+                                    // Carry over click count to replacement session
+                                    for _ in 0..session_clicks { s.increment_clicks(); }
                                     session = s;
                                     already_logged_in = false;
                                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1157,6 +1041,8 @@ async fn run_session_loop(
 
                             match pool.get_session(&session_id).await {
                                 Some(s) => {
+                                    // Carry over click count to replacement session
+                                    for _ in 0..session_clicks { s.increment_clicks(); }
                                     session = s;
                                     already_logged_in = false;
                                     tokio::time::sleep(Duration::from_millis(1000)).await;
