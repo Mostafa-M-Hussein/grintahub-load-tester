@@ -2,7 +2,7 @@
 # Multi-stage build for smaller final image
 
 # ===== Stage 1: Build =====
-FROM rust:1.77-bookworm AS builder
+FROM rust:1.83-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
