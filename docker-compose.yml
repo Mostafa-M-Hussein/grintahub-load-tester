@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  grintahub:
+    build: .
+    container_name: grintahub-clicker
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Web dashboard settings
+      - GRINTAHUB_WEB_PORT=8080
+      - GRINTAHUB_WEB_USER=admin
+      - GRINTAHUB_WEB_PASS=${GRINTAHUB_PASSWORD:-changeme}
+      # Logging
+      - RUST_LOG=info
+    volumes:
+      # Persist config between restarts
+      - grintahub-config:/home/grintahub/.config/grintahub-clicker
+    # Chrome needs these for running in container
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+
+volumes:
+  grintahub-config:
