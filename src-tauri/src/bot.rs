@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{info, warn, error};
+use rand::Rng;
+use tracing::{info, warn, error, debug};
 
 use crate::AppState;
 use crate::browser::{BrowserPool, BrowserActions, BrowserError, GoogleAccount};
@@ -76,7 +77,7 @@ pub struct OxylabsUsage {
 
 /// Start the bot - shared logic for both Tauri and web server modes.
 pub async fn start_bot_logic(state: &AppState) -> Result<(), String> {
-    if state.is_running.load(Ordering::Relaxed) {
+    if state.is_running.load(Ordering::SeqCst) {
         return Err("Bot is already running".into());
     }
 
@@ -98,12 +99,36 @@ pub async fn start_bot_logic(state: &AppState) -> Result<(), String> {
     // (IP rotation, error recovery, supervisor respawn) use the correct mode
     state.browser_pool.set_default_headless(config.headless).await;
 
+    // Find and configure 2Captcha browser extension (auto-solves CAPTCHAs in-browser)
+    if !config.captcha_api_key.is_empty() {
+        if let Some(ext_dir) = crate::browser::BrowserSessionConfig::find_captcha_extension() {
+            match crate::browser::BrowserSessionConfig::configure_captcha_extension(&ext_dir, &config.captcha_api_key) {
+                Ok(()) => {
+                    // Canonicalize the path so Chrome can find it
+                    let abs_path = std::path::Path::new(&ext_dir)
+                        .canonicalize()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or(ext_dir);
+                    info!("2Captcha extension configured, loading from: {}", abs_path);
+                    state.browser_pool.set_captcha_extension(Some(abs_path)).await;
+                }
+                Err(e) => {
+                    warn!("Failed to configure 2Captcha extension: {} — falling back to programmatic solving", e);
+                }
+            }
+        } else {
+            warn!("2Captcha extension not found — CAPTCHA solving will rely on programmatic API calls");
+        }
+    } else {
+        warn!("No 2Captcha API key configured — CAPTCHAs will cause IP rotation");
+    }
+
     let session_ids = state.browser_pool
         .spawn_sessions_with_options(config.concurrent_sessions, Some(config.headless))
         .await
         .map_err(|e| e.to_string())?;
 
-    state.is_running.store(true, Ordering::Relaxed);
+    state.is_running.store(true, Ordering::SeqCst);
     state.global_stats.reset();
 
     let google_account: Option<GoogleAccount> = config.accounts
@@ -177,7 +202,7 @@ pub async fn start_bot_logic(state: &AppState) -> Result<(), String> {
 /// Stop the bot - shared logic for both Tauri and web server modes.
 pub async fn stop_bot_logic(state: &AppState) -> Result<(), String> {
     info!("Stopping bot");
-    state.is_running.store(false, Ordering::Relaxed);
+    state.is_running.store(false, Ordering::SeqCst);
 
     {
         let mut handle = state.supervisor_handle.lock().await;
@@ -204,7 +229,7 @@ pub async fn get_bot_status_logic(state: &AppState) -> BotStatus {
     let sessions = state.browser_pool.session_count().await;
 
     BotStatus {
-        is_running: state.is_running.load(Ordering::Relaxed),
+        is_running: state.is_running.load(Ordering::SeqCst),
         active_sessions: sessions,
         total_clicks: stats.total_success,
         total_errors: stats.total_errors,
@@ -796,62 +821,6 @@ pub fn spawn_session_task_safe(
     })
 }
 
-/// Verify a session has a unique IP (not used by any other session).
-async fn ensure_unique_ip(
-    session_id: String,
-    session: Arc<crate::browser::BrowserSession>,
-    pool: &Arc<BrowserPool>,
-    max_retries: u32,
-) -> Option<(String, Arc<crate::browser::BrowserSession>)> {
-    let mut current_id = session_id;
-    let mut current_session = session;
-
-    for attempt in 0..=max_retries {
-        match current_session.detect_ip().await {
-            Ok(ip) => {
-                if pool.register_ip(&ip).await {
-                    info!("Session {} verified unique IP: {}", current_id, ip);
-                    return Some((current_id, current_session));
-                }
-
-                warn!("Session {} got duplicate IP {} (attempt {}/{}), retrying with new session",
-                    current_id, ip, attempt + 1, max_retries + 1);
-
-                let _ = pool.close_session(&current_id).await;
-                tokio::time::sleep(Duration::from_millis(300)).await;
-
-                match pool.spawn_sessions(1).await {
-                    Ok(new_ids) if !new_ids.is_empty() => {
-                        let new_id = new_ids.into_iter().next().unwrap();
-                        match pool.get_session(&new_id).await {
-                            Some(s) => {
-                                current_id = new_id;
-                                current_session = s;
-                                continue;
-                            }
-                            None => {
-                                error!("New session {} not found after spawn", new_id);
-                                return None;
-                            }
-                        }
-                    }
-                    _ => {
-                        error!("Failed to spawn replacement session for unique IP");
-                        return None;
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Session {} IP detection failed: {} - continuing with random sessid guarantee", current_id, e);
-                return Some((current_id, current_session));
-            }
-        }
-    }
-
-    error!("Failed to get unique IP after {} retries", max_retries + 1);
-    None
-}
-
 /// Run the bot loop for a single session
 async fn run_session_loop(
     mut session_id: String,
@@ -883,15 +852,41 @@ async fn run_session_loop(
         }
     };
 
-    match ensure_unique_ip(session_id.clone(), session, &pool, 3).await {
-        Some((verified_id, verified_session)) => {
-            session_id = verified_id;
-            session = verified_session;
+    // Detect proxy IP via browser navigation (confirms proxy is working)
+    match tokio::time::timeout(
+        Duration::from_secs(15),
+        session.detect_ip()
+    ).await {
+        Ok(Ok(ip)) => {
+            info!("Session {} proxy IP confirmed: {}", session_id, ip);
         }
-        None => {
-            error!("Session {} could not get a unique IP, stopping", session_id);
-            stats.remove_session();
-            return;
+        Ok(Err(e)) => {
+            warn!("Session {} IP detection failed (proxy may still work): {}", session_id, e);
+        }
+        Err(_) => {
+            warn!("Session {} IP detection timed out (proxy may still work)", session_id);
+        }
+    }
+
+    // === WARM-UP PHASE: Build trust before first Google search ===
+    // Visit Google (get cookies), browse 1-2 lightweight sites.
+    // This reduces CAPTCHA triggers by making the session look established.
+    info!("Session {} starting warm-up phase before main loop", session_id);
+    if let Err(e) = BrowserActions::warm_up_session(&session).await {
+        warn!("Session {} warm-up failed (continuing anyway): {}", session_id, e);
+    }
+
+    // Optional: Do one organic search before starting keyword searches (50% chance)
+    if rand::thread_rng().gen_bool(0.5) {
+        info!("Session {} doing initial organic search before target keywords", session_id);
+        match BrowserActions::organic_search(&session).await {
+            Err(BrowserError::CaptchaDetected(_)) => {
+                warn!("Session {} hit CAPTCHA during warm-up organic search — continuing to main loop", session_id);
+            }
+            Err(e) => {
+                debug!("Session {} warm-up organic search failed (non-fatal): {}", session_id, e);
+            }
+            Ok(()) => {}
         }
     }
 
@@ -905,7 +900,7 @@ async fn run_session_loop(
     let mut ip_rotation_count: u32 = 0;
     let keyword_count = keywords.len();
 
-    while is_running.load(Ordering::Relaxed) {
+    while is_running.load(Ordering::SeqCst) {
         if max_clicks > 0 && session_clicks >= max_clicks {
             info!("Session {} reached max clicks limit ({}), closing", session_id, max_clicks);
             break;
@@ -913,6 +908,26 @@ async fn run_session_loop(
 
         rate_limiter.wait().await;
         session.increment_cycles();
+
+        // === ORGANIC SEARCH MIXING: 25% chance before target search ===
+        // Makes the session look like a real user who does varied searches.
+        if rand::thread_rng().gen_bool(0.25) {
+            debug!("Session {} doing organic search before target keyword", session_id);
+            match BrowserActions::organic_search(&session).await {
+                Err(BrowserError::CaptchaDetected(msg)) => {
+                    warn!("Session {} hit CAPTCHA during organic search: {}", session_id, msg);
+                    // Don't continue to target search — handle CAPTCHA in the normal flow
+                    // by falling through to the next iteration
+                    continue;
+                }
+                Err(e) => {
+                    debug!("Session {} organic search failed (non-fatal): {}", session_id, e);
+                }
+                Ok(()) => {
+                    BrowserActions::human_delay(2000, 2000).await;
+                }
+            }
+        }
 
         let keyword = &keywords[keyword_index % keywords.len()];
         keyword_index += 1;
@@ -930,6 +945,7 @@ async fn run_session_loop(
                 let latency = cycle_start.elapsed().as_millis() as u64;
                 if clicked {
                     stats.record_click(latency);
+                    session.increment_clicks();
                     rate_limiter.record_success();
                     session_clicks += 1;
                     consecutive_errors = 0;
@@ -943,7 +959,7 @@ async fn run_session_loop(
                     tokio::time::sleep(Duration::from_millis(1000)).await;
 
                     loop {
-                        if !is_running.load(Ordering::Relaxed) { break; }
+                        if !is_running.load(Ordering::SeqCst) { break; }
                         match pool.spawn_sessions(1).await {
                             Ok(new_ids) if !new_ids.is_empty() => {
                                 let new_id = new_ids.into_iter().next().unwrap();
@@ -975,44 +991,79 @@ async fn run_session_loop(
             Err(BrowserError::CaptchaDetected(msg)) => {
                 warn!("Session {} CAPTCHA detected: {}", session_id, msg);
 
+                // === 2Captcha BROWSER EXTENSION handles solving ===
+                // The extension auto-detects reCAPTCHA, sends to 2Captcha API,
+                // injects the token, calls submitCallback, and auto-submits.
+                // We just need to wait for it to finish (page leaves /sorry/).
                 let mut solved = false;
                 if !captcha_api_key.is_empty() {
-                    info!("Session {} attempting to solve CAPTCHA with 2Captcha...", session_id);
-                    match BrowserActions::solve_google_captcha(&session, &captcha_api_key).await {
-                        Ok(true) => {
-                            info!("Session {} CAPTCHA solved successfully! Continuing...", session_id);
+                    info!("Session {} waiting for 2Captcha browser extension to solve CAPTCHA...", session_id);
+                    session.increment_captchas();
+
+                    // Poll every 5 seconds for up to 120 seconds (typical solve: 20-60s)
+                    let max_wait = 120;
+                    let poll_interval = 5;
+                    for elapsed in (0..max_wait).step_by(poll_interval) {
+                        tokio::time::sleep(Duration::from_secs(poll_interval as u64)).await;
+
+                        if !is_running.load(Ordering::SeqCst) { break; }
+
+                        // Check if page left the CAPTCHA (/sorry/) page
+                        let still_captcha = BrowserActions::check_google_captcha(&session).await.unwrap_or(true);
+                        if !still_captcha {
+                            info!("Session {} CAPTCHA SOLVED by extension after ~{}s! Page redirected to search results.",
+                                session_id, elapsed + poll_interval);
                             solved = true;
-                            consecutive_errors = 0;
+                            break;
                         }
-                        Ok(false) => {
-                            warn!("Session {} CAPTCHA solve returned false", session_id);
-                        }
-                        Err(e) => {
-                            warn!("Session {} CAPTCHA solve failed: {}", session_id, e);
-                        }
+
+                        debug!("Session {} still on CAPTCHA page ({}/{}s)...", session_id, elapsed + poll_interval, max_wait);
                     }
                 } else {
-                    warn!("Session {} no 2Captcha API key configured, falling back to IP change", session_id);
+                    warn!("Session {} no 2Captcha API key — extension not loaded, skipping solve", session_id);
                 }
+
+                // OLD PROGRAMMATIC SOLVING (commented out — kept as fallback)
+                // if !captcha_api_key.is_empty() {
+                //     info!("Session {} attempting to solve CAPTCHA with 2Captcha API...", session_id);
+                //     match BrowserActions::solve_google_captcha(&session, &captcha_api_key).await {
+                //         Ok(true) => {
+                //             info!("Session {} CAPTCHA solved successfully! Continuing...", session_id);
+                //             solved = true;
+                //             consecutive_errors = 0;
+                //         }
+                //         Ok(false) => {
+                //             warn!("Session {} CAPTCHA solve returned false", session_id);
+                //         }
+                //         Err(e) => {
+                //             warn!("Session {} CAPTCHA solve failed: {}", session_id, e);
+                //         }
+                //     }
+                // }
 
                 if solved {
                     consecutive_errors = 0;
                     continue;
                 }
 
-                warn!("Session {} CAPTCHA not solved - changing IP", session_id);
+                warn!("Session {} CAPTCHA not solved after 120s - changing IP", session_id);
                 stats.record_error();
                 session.increment_errors();
                 consecutive_errors += 1;
 
-                if consecutive_errors > 10 {
-                    let backoff = std::cmp::min(consecutive_errors as u64 * 1000, 30_000);
-                    warn!("Session {} backing off {}ms ({} consecutive errors)", session_id, backoff, consecutive_errors);
-                    tokio::time::sleep(Duration::from_millis(backoff)).await;
-                }
+                // IMPORTANT: Exponential backoff before IP rotation.
+                // Rapid IP rotation is itself a strong bot signal for Google.
+                // 10s -> 20s -> 40s -> 80s -> 160s (cap 5min)
+                let captcha_backoff = std::cmp::min(
+                    10_000u64 * 2u64.pow(consecutive_errors.min(5)),
+                    300_000 // Cap at 5 minutes
+                );
+                info!("Session {} waiting {}s before IP rotation (exponential backoff, error #{})",
+                    session_id, captcha_backoff / 1000, consecutive_errors);
+                tokio::time::sleep(Duration::from_millis(captcha_backoff)).await;
 
                 let _ = pool.close_session(&session_id).await;
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(1000)).await;
 
                 match pool.spawn_sessions(1).await {
                     Ok(new_ids) if !new_ids.is_empty() => {
@@ -1042,14 +1093,16 @@ async fn run_session_loop(
                 }
             }
             Err(BrowserError::ElementNotFound(msg)) if msg.contains("need new IP") => {
-                warn!("Session {} no ad found: {} - FAST IP change", session_id, msg);
+                warn!("Session {} no ad found: {} - changing IP", session_id, msg);
                 ip_rotation_count += 1;
 
                 let _ = pool.close_session(&session_id).await;
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                // Wait 3-8 seconds before spawning new session (reduces rapid cycling detection)
+                let no_ad_delay = 3000 + rand::thread_rng().gen_range(0..5000u64);
+                tokio::time::sleep(Duration::from_millis(no_ad_delay)).await;
 
                 loop {
-                    if !is_running.load(Ordering::Relaxed) { break; }
+                    if !is_running.load(Ordering::SeqCst) { break; }
                     match pool.spawn_sessions(1).await {
                         Ok(new_ids) if !new_ids.is_empty() => {
                             let new_id = new_ids.into_iter().next().unwrap();
@@ -1095,7 +1148,7 @@ async fn run_session_loop(
                 tokio::time::sleep(Duration::from_millis(1000)).await;
 
                 loop {
-                    if !is_running.load(Ordering::Relaxed) { break; }
+                    if !is_running.load(Ordering::SeqCst) { break; }
                     match pool.spawn_sessions(1).await {
                         Ok(new_ids) if !new_ids.is_empty() => {
                             let new_id = new_ids.into_iter().next().unwrap();
@@ -1135,7 +1188,7 @@ async fn run_session_loop(
                     tokio::time::sleep(Duration::from_millis(500)).await;
 
                     loop {
-                        if !is_running.load(Ordering::Relaxed) { break; }
+                        if !is_running.load(Ordering::SeqCst) { break; }
                         match pool.spawn_sessions(1).await {
                             Ok(new_ids) if !new_ids.is_empty() => {
                                 let new_id = new_ids.into_iter().next().unwrap();

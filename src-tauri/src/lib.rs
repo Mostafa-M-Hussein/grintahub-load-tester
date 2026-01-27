@@ -75,7 +75,7 @@ pub struct AppConfig {
 }
 
 /// Default session time in minutes
-fn default_sesstime() -> u16 { 10 }
+fn default_sesstime() -> u16 { 30 }
 
 impl Default for AppConfig {
     fn default() -> Self {

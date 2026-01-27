@@ -166,6 +166,7 @@ impl CaptchaSolver {
             CaptchaType::RecaptchaV2 if request.enterprise => TwoCaptchaTask::RecaptchaV2EnterpriseProxyless {
                 website_url: request.page_url.clone(),
                 website_key: request.sitekey.clone(),
+                recaptcha_data_s_value: request.data_s.clone(),
             },
             CaptchaType::RecaptchaV2 => TwoCaptchaTask::RecaptchaV2Proxyless {
                 website_url: request.page_url.clone(),
@@ -193,9 +194,10 @@ impl CaptchaSolver {
         };
 
         // Debug: Log the request being sent (without API key)
-        debug!("2Captcha createTask request: type={:?}, enterprise={}, url={}, sitekey={}...",
+        debug!("2Captcha createTask request: type={:?}, enterprise={}, data_s={}, url={}, sitekey={}...",
             request.captcha_type,
             request.enterprise,
+            request.data_s.as_ref().map(|s| format!("{}...", &s[..s.len().min(20)])).unwrap_or_else(|| "none".to_string()),
             &request.page_url[..request.page_url.len().min(80)],
             &request.sitekey[..request.sitekey.len().min(20)]
         );

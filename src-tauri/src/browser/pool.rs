@@ -53,6 +53,9 @@ pub struct BrowserPool {
     /// Runtime headless override — set when bot starts so replacement sessions
     /// spawned via `spawn_sessions(1)` use the correct headless mode.
     headless_override: RwLock<Option<bool>>,
+    /// Runtime captcha extension dir override — set when bot starts so all
+    /// sessions load the 2Captcha solver extension.
+    captcha_extension_override: RwLock<Option<String>>,
 }
 
 impl BrowserPool {
@@ -65,6 +68,7 @@ impl BrowserPool {
             statuses: Arc::new(RwLock::new(HashMap::new())),
             used_ips: Arc::new(RwLock::new(HashSet::new())),
             headless_override: RwLock::new(None),
+            captcha_extension_override: RwLock::new(None),
         }
     }
 
@@ -81,6 +85,11 @@ impl BrowserPool {
     /// the correct headless setting from the config.
     pub async fn set_default_headless(&self, headless: bool) {
         self.headless_override.write().await.replace(headless);
+    }
+
+    /// Set the 2Captcha extension directory for all future sessions.
+    pub async fn set_captcha_extension(&self, extension_dir: Option<String>) {
+        *self.captcha_extension_override.write().await = extension_dir;
     }
 
     /// Spawn multiple browser sessions in parallel (uses default headless setting)
@@ -128,11 +137,16 @@ impl BrowserPool {
         for i in 0..count {
             let proxy = proxies.as_ref().map(|p| p[i].clone());
             let unique_id = format!("{}_{}", Uuid::new_v4().to_string()[..8].to_string(), i);
+            // Use captcha extension override if set, otherwise fall back to default config
+            let ext_dir = self.captcha_extension_override.read().await.clone()
+                .or_else(|| self.default_config.captcha_extension_dir.clone());
+
             let config = BrowserSessionConfig::for_session(&unique_id)
                 .headless(headless_mode)
                 .proxy(proxy.clone())
                 .chrome_path(self.default_config.chrome_path.clone())
-                .timeout(self.default_config.timeout_secs);
+                .timeout(self.default_config.timeout_secs)
+                .captcha_extension(ext_dir);
 
             if let Some(ref p) = proxy {
                 info!("Session {} will use proxy: {}", i + 1, p.split('@').last().unwrap_or("unknown"));

@@ -55,7 +55,7 @@ impl SessionSupervisor {
             // Wait for initial sessions to stabilize
             tokio::time::sleep(supervisor_config.initial_delay).await;
 
-            if !is_running.load(Ordering::Relaxed) {
+            if !is_running.load(Ordering::SeqCst) {
                 return;
             }
 
@@ -64,10 +64,10 @@ impl SessionSupervisor {
 
             let mut tick_counter: u64 = 0;
 
-            while is_running.load(Ordering::Relaxed) {
+            while is_running.load(Ordering::SeqCst) {
                 tokio::time::sleep(supervisor_config.check_interval).await;
 
-                if !is_running.load(Ordering::Relaxed) {
+                if !is_running.load(Ordering::SeqCst) {
                     break;
                 }
 

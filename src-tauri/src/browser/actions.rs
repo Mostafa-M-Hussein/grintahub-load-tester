@@ -8,9 +8,8 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use tracing::{info, debug, warn, error};
-use base64::Engine;
 
 use super::{BrowserSession, BrowserError};
 
@@ -192,6 +191,15 @@ impl BrowserActions {
                     } catch(e) {}
                 }
 
+                // Extract data-s parameter (CRITICAL for Google /sorry/ pages)
+                // This is a one-time-use token. If the reCAPTCHA widget loads
+                // before we send it to the solver, the data-s is consumed and
+                // the solved token will be rejected by Google.
+                let dataS = null;
+                if (recaptchaDiv) {
+                    dataS = recaptchaDiv.getAttribute('data-s');
+                }
+
                 // Detect callback function name
                 let callbackName = null;
                 if (recaptchaDiv) {
@@ -221,6 +229,7 @@ impl BrowserActions {
                     url: url,
                     sitekey: sitekey,
                     method: method,
+                    dataS: dataS,
                     isGoogleSorry: isGoogleSorry,
                     isEnterprise: isEnterprise,
                     callbackName: callbackName,
@@ -234,14 +243,17 @@ impl BrowserActions {
 
         let page_url = captcha_info.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let method = captcha_info.get("method").and_then(|v| v.as_str()).unwrap_or("none");
+        let data_s = captcha_info.get("dataS").and_then(|v| v.as_str()).map(|s| s.to_string());
         let is_google_sorry = captcha_info.get("isGoogleSorry").and_then(|v| v.as_bool()).unwrap_or(false);
         let is_enterprise = captcha_info.get("isEnterprise").and_then(|v| v.as_bool()).unwrap_or(false);
         let callback_name = captcha_info.get("callbackName").and_then(|v| v.as_str());
         let form_count = captcha_info.get("formCount").and_then(|v| v.as_u64()).unwrap_or(0);
         let body_preview = captcha_info.get("bodyPreview").and_then(|v| v.as_str()).unwrap_or("");
 
-        info!("Session {} CAPTCHA page: google_sorry={}, enterprise={}, method={}, forms={}, callback={:?}, url={}",
-            session.id, is_google_sorry, is_enterprise, method, form_count, callback_name, &page_url[..page_url.len().min(80)]);
+        info!("Session {} CAPTCHA page: google_sorry={}, enterprise={}, method={}, data_s={}, forms={}, callback={:?}, url={}",
+            session.id, is_google_sorry, is_enterprise, method,
+            data_s.as_ref().map(|s| format!("{}...({}chars)", &s[..s.len().min(20)], s.len())).unwrap_or_else(|| "NONE".to_string()),
+            form_count, callback_name, &page_url[..page_url.len().min(80)]);
         debug!("Session {} page body: {}", session.id, body_preview);
 
         let sitekey = match captcha_info.get("sitekey").and_then(|v| v.as_str()) {
@@ -264,9 +276,16 @@ impl BrowserActions {
         };
 
         // Use Enterprise variant for Google sorry pages (they use reCAPTCHA Enterprise)
+        // CRITICAL: Pass data-s parameter for Google /sorry/ pages - without it,
+        // the solved token will be rejected by Google even if 2Captcha solves it correctly.
         let request = if is_enterprise || is_google_sorry {
-            info!("Session {} using reCAPTCHA Enterprise solver", session.id);
-            crate::captcha::CaptchaRequest::recaptcha_v2_enterprise(&sitekey, &page_url)
+            if let Some(ref ds) = data_s {
+                info!("Session {} using reCAPTCHA Enterprise solver WITH data-s ({}chars)", session.id, ds.len());
+                crate::captcha::CaptchaRequest::recaptcha_v2_enterprise_with_data_s(&sitekey, &page_url, ds)
+            } else {
+                warn!("Session {} using reCAPTCHA Enterprise solver WITHOUT data-s (may fail!)", session.id);
+                crate::captcha::CaptchaRequest::recaptcha_v2_enterprise(&sitekey, &page_url)
+            }
         } else {
             crate::captcha::CaptchaRequest::recaptcha_v2(&sitekey, &page_url)
         };
@@ -282,22 +301,23 @@ impl BrowserActions {
             }
         };
 
-        // 3. Inject token and submit the form
-        let token = result.token.replace('\'', "\\'").replace('\n', "\\n");
-        let callback_js = if let Some(cb) = callback_name {
-            format!(
-                "if (typeof {} === 'function') {{ try {{ {}('{}'); }} catch(e) {{}} }}",
-                cb, cb, token
-            )
-        } else {
-            String::new()
-        };
+        // 3. Inject token and submit via callback
+        // CRITICAL: For Google /sorry/ pages, we MUST:
+        //   a) Inject the token into g-recaptcha-response textareas
+        //   b) Call the callback function (usually "submitCallback" from data-callback attr)
+        //   c) Wait 5-10 seconds for Google to validate the token server-side
+        //   d) Google will auto-redirect to search results if valid
+        // Just calling form.submit() does NOT work — Google needs the callback path.
+        let token = result.token.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n");
+        let callback_name_str = callback_name.unwrap_or("").to_string();
 
         let inject_script = format!(r#"
             (function() {{
                 const token = '{}';
+                const callbackName = '{}';
                 let injected = false;
-                let submitted = false;
+                let callbackCalled = false;
+                let callbackMethod = 'none';
 
                 // Step 1: Inject token into ALL g-recaptcha-response textareas
                 const textareas = document.querySelectorAll('#g-recaptcha-response, textarea[name="g-recaptcha-response"]');
@@ -309,21 +329,49 @@ impl BrowserActions {
                     injected = true;
                 }}
 
-                // Step 2: Try data-callback function
-                {}
+                // Also ensure hidden input exists in form
+                const forms = document.querySelectorAll('form');
+                for (const form of forms) {{
+                    let hiddenInput = form.querySelector('input[name="g-recaptcha-response"]');
+                    if (!hiddenInput) {{
+                        hiddenInput = document.createElement('input');
+                        hiddenInput.type = 'hidden';
+                        hiddenInput.name = 'g-recaptcha-response';
+                        form.appendChild(hiddenInput);
+                    }}
+                    hiddenInput.value = token;
+                }}
 
-                // Step 3: Try ___grecaptcha_cfg callback (deep search)
-                if (typeof ___grecaptcha_cfg !== 'undefined') {{
+                // Step 2: Call the data-callback function (PRIMARY submission method)
+                // For Google /sorry/ pages this is typically "submitCallback"
+                // The callback tells Google's JS to validate and submit the token
+                if (callbackName && typeof window[callbackName] === 'function') {{
+                    try {{
+                        window[callbackName](token);
+                        callbackCalled = true;
+                        callbackMethod = 'data-callback: ' + callbackName;
+                    }} catch(e) {{
+                        callbackMethod = 'data-callback-error: ' + e.message;
+                    }}
+                }}
+
+                // Step 3: Try ___grecaptcha_cfg callback (deep search in reCAPTCHA internals)
+                if (!callbackCalled && typeof ___grecaptcha_cfg !== 'undefined') {{
                     try {{
                         const clients = ___grecaptcha_cfg.clients;
                         for (const ckey in clients) {{
+                            if (callbackCalled) break;
                             const client = clients[ckey];
-                            // Search nested objects for callback functions
                             const searchObj = (obj, depth) => {{
-                                if (depth > 5 || !obj) return;
+                                if (callbackCalled || depth > 5 || !obj) return;
                                 for (const key in obj) {{
+                                    if (callbackCalled) break;
                                     if (typeof obj[key] === 'function' && key.toLowerCase().includes('callback')) {{
-                                        try {{ obj[key](token); submitted = true; }} catch(e) {{}}
+                                        try {{
+                                            obj[key](token);
+                                            callbackCalled = true;
+                                            callbackMethod = 'grecaptcha_cfg.' + ckey + '.' + key;
+                                        }} catch(e) {{}}
                                     }} else if (typeof obj[key] === 'object' && obj[key] !== null) {{
                                         searchObj(obj[key], depth + 1);
                                     }}
@@ -334,102 +382,107 @@ impl BrowserActions {
                     }} catch(e) {{}}
                 }}
 
-                // Step 4: Try global callback functions commonly used by Google
-                const globalCallbacks = ['onCaptchaSuccess', 'captchaCallback', 'recaptchaCallback', 'onSuccess'];
-                for (const name of globalCallbacks) {{
-                    if (typeof window[name] === 'function') {{
-                        try {{ window[name](token); submitted = true; }} catch(e) {{}}
+                // Step 4: Try well-known global callback names
+                if (!callbackCalled) {{
+                    const globalCallbacks = ['submitCallback', 'onCaptchaSuccess', 'captchaCallback', 'recaptchaCallback', 'onSuccess'];
+                    for (const name of globalCallbacks) {{
+                        if (typeof window[name] === 'function') {{
+                            try {{
+                                window[name](token);
+                                callbackCalled = true;
+                                callbackMethod = 'global: ' + name;
+                                break;
+                            }} catch(e) {{}}
+                        }}
                     }}
                 }}
 
-                // Step 5: Submit form if not already submitted by callback
-                if (!submitted) {{
-                    // For Google sorry page: find the specific form
-                    const forms = document.querySelectorAll('form');
+                // Step 5: LAST RESORT - form submit (less reliable, Google may reject)
+                // Only if no callback was found/worked
+                let formSubmitted = false;
+                if (!callbackCalled) {{
                     for (const form of forms) {{
-                        // Check if this form has the captcha response
                         const hasResponse = form.querySelector('[name="g-recaptcha-response"]') ||
                                            form.querySelector('#g-recaptcha-response');
                         if (hasResponse || forms.length === 1) {{
-                            // Ensure the token is in a hidden input too (some forms need this)
-                            let hiddenInput = form.querySelector('input[name="g-recaptcha-response"]');
-                            if (!hiddenInput) {{
-                                hiddenInput = document.createElement('input');
-                                hiddenInput.type = 'hidden';
-                                hiddenInput.name = 'g-recaptcha-response';
-                                hiddenInput.value = token;
-                                form.appendChild(hiddenInput);
-                            }} else {{
-                                hiddenInput.value = token;
-                            }}
-
-                            setTimeout(() => form.submit(), 300);
-                            submitted = true;
+                            form.submit();
+                            formSubmitted = true;
+                            callbackMethod = 'form.submit (fallback)';
                             break;
                         }}
                     }}
                 }}
 
-                // Step 6: Last resort - click submit button
-                if (!submitted) {{
-                    const btn = document.querySelector('input[type="submit"], button[type="submit"], #submit, .submit');
-                    if (btn) {{
-                        setTimeout(() => btn.click(), 300);
-                        submitted = true;
-                    }}
-                }}
-
-                return {{ injected: injected, submitted: submitted, textareaCount: textareas.length }};
+                return {{
+                    injected: injected,
+                    callbackCalled: callbackCalled,
+                    formSubmitted: formSubmitted,
+                    callbackMethod: callbackMethod,
+                    textareaCount: textareas.length
+                }};
             }})()
-        "#, token, callback_js);
+        "#, token, callback_name_str);
 
         let inject_result = session.execute_js(&inject_script).await?;
 
         let injected = inject_result.get("injected").and_then(|v| v.as_bool()).unwrap_or(false);
-        let submitted = inject_result.get("submitted").and_then(|v| v.as_bool()).unwrap_or(false);
+        let callback_called = inject_result.get("callbackCalled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let form_submitted = inject_result.get("formSubmitted").and_then(|v| v.as_bool()).unwrap_or(false);
+        let callback_method = inject_result.get("callbackMethod").and_then(|v| v.as_str()).unwrap_or("none");
         let textarea_count = inject_result.get("textareaCount").and_then(|v| v.as_u64()).unwrap_or(0);
 
-        info!("Session {} token injection: injected={}, submitted={}, textareas={}",
-            session.id, injected, submitted, textarea_count);
+        info!("Session {} token injection: injected={}, callback={}, formSubmit={}, method='{}', textareas={}",
+            session.id, injected, callback_called, form_submitted, callback_method, textarea_count);
 
-        if submitted {
-            info!("Session {} CAPTCHA solved and form submitted! Waiting for redirect...", session.id);
-            // Wait for the page to redirect after form submission
-            Self::human_delay(3000, 2000).await;
+        if callback_called || form_submitted {
+            // CRITICAL: Wait 5-10 seconds for Google to validate the token server-side.
+            // Google's /sorry/ page sends the token to its backend for verification.
+            // If we check too early, the redirect hasn't happened yet.
+            let validation_wait = {
+                let mut rng = rand::thread_rng();
+                rng.gen_range(5000..=10000u64)
+            };
+            info!("Session {} waiting {}ms for Google to validate token (via {})...",
+                session.id, validation_wait, callback_method);
+            tokio::time::sleep(Duration::from_millis(validation_wait)).await;
 
             // Verify we left the CAPTCHA page
             let still_blocked = Self::check_google_captcha(session).await.unwrap_or(true);
             if !still_blocked {
-                info!("Session {} CAPTCHA bypass SUCCESS - page loaded", session.id);
+                info!("Session {} CAPTCHA bypass SUCCESS - redirected to search results!", session.id);
                 return Ok(true);
-            } else {
-                warn!("Session {} still blocked after CAPTCHA submission", session.id);
-                // Try one more wait - Google sometimes takes a moment
-                Self::human_delay(2000, 1000).await;
-                let still_blocked2 = Self::check_google_captcha(session).await.unwrap_or(true);
-                if !still_blocked2 {
-                    info!("Session {} CAPTCHA bypass SUCCESS (delayed)", session.id);
-                    return Ok(true);
-                }
-                return Ok(false);
             }
+
+            // Give it more time - Google validation can be slow
+            warn!("Session {} still on CAPTCHA page after {}ms, waiting 5s more...", session.id, validation_wait);
+            tokio::time::sleep(Duration::from_millis(5000)).await;
+
+            let still_blocked2 = Self::check_google_captcha(session).await.unwrap_or(true);
+            if !still_blocked2 {
+                info!("Session {} CAPTCHA bypass SUCCESS (delayed validation)", session.id);
+                return Ok(true);
+            }
+
+            warn!("Session {} CAPTCHA token rejected by Google (method: {})", session.id, callback_method);
+            return Ok(false);
         } else if injected {
-            warn!("Session {} token injected but form not submitted - trying manual submit", session.id);
-            // Try a direct form submit as last resort
+            warn!("Session {} token injected but NO callback found - trying form.submit() as last resort", session.id);
             let _ = session.execute_js(r#"
                 const form = document.querySelector('form');
                 if (form) form.submit();
             "#).await;
-            Self::human_delay(3000, 2000).await;
+
+            // Wait for potential redirect
+            tokio::time::sleep(Duration::from_millis(7000)).await;
 
             let still_blocked = Self::check_google_captcha(session).await.unwrap_or(true);
             if !still_blocked {
-                info!("Session {} CAPTCHA resolved after manual submit", session.id);
+                info!("Session {} CAPTCHA resolved after manual form submit", session.id);
                 return Ok(true);
             }
             return Ok(false);
         } else {
-            warn!("Session {} could not inject token (no textarea found)", session.id);
+            warn!("Session {} could not inject token (no textarea found, {} textareas)", session.id, textarea_count);
             return Ok(false);
         }
     }
@@ -684,11 +737,34 @@ impl BrowserActions {
     pub async fn goto_google(session: &Arc<BrowserSession>) -> Result<(), BrowserError> {
         info!("Session {} navigating to Google", session.id);
 
-        // Navigate to Google Saudi Arabia directly for better regional targeting
+        // TODO: Re-enable warmup browsing when proxy bandwidth is not an issue.
+        // Pre-search warm-up was flooding the proxy with ad tracker requests (taboola,
+        // pubmatic, doubleclick, etc.) causing 522 timeouts from Oxylabs.
+        // let warmup_sites = [
+        //     "https://www.wikipedia.org",
+        //     "https://weather.com",
+        //     "https://www.bbc.com",
+        //     "https://www.reuters.com",
+        //     "https://timeanddate.com",
+        // ];
+        // let warmup_idx = rand::thread_rng().gen_range(0..warmup_sites.len());
+        // let warmup_url = warmup_sites[warmup_idx];
+        // info!("Session {} pre-search warmup: visiting {}", session.id, warmup_url);
+        // if let Err(e) = session.navigate(warmup_url).await {
+        //     debug!("Session {} warmup navigation failed (non-fatal): {}", session.id, e);
+        // } else {
+        //     Self::human_delay(3000, 5000).await;
+        //     if let Err(e) = session.scroll_human(300).await {
+        //         debug!("Session {} warmup scroll failed (non-fatal): {}", session.id, e);
+        //     }
+        //     Self::human_delay(1000, 2000).await;
+        // }
+
+        // Navigate to Google Saudi Arabia
         session.navigate("https://www.google.com.sa/").await?;
 
-        // Wait for page to load
-        Self::human_delay(1500, 500).await;
+        // Wait for page to load (longer with proxy latency)
+        Self::human_delay(2000, 1000).await;
 
         // Handle any consent dialogs or interstitials (common in Middle East/EU)
         let handled_consent = session.execute_js(r#"
@@ -757,7 +833,21 @@ impl BrowserActions {
         info!("Session {} consent handling result: {:?}", session.id, handled_consent);
 
         // Brief wait after handling consent
-        Self::human_delay(300, 200).await;
+        Self::human_delay(500, 300).await;
+
+        // Human-like behavior on Google homepage: CDP mouse movements (isTrusted: true)
+        // Real users look around the page before clicking the search box
+        {
+            let mut rng = rand::rngs::StdRng::from_entropy();
+            let moves = rng.gen_range(2..=4);
+            for _ in 0..moves {
+                let rand_x = rng.gen_range(200.0..1200.0);
+                let rand_y = rng.gen_range(100.0..600.0);
+                session.move_mouse_human(rand_x, rand_y).await.ok();
+                Self::random_delay(300, 500).await;
+            }
+        }
+        Self::human_delay(500, 500).await;
 
         // Check for CAPTCHA
         if Self::check_google_captcha(session).await? {
@@ -793,84 +883,119 @@ impl BrowserActions {
     pub async fn google_search(session: &Arc<BrowserSession>, keyword: &str) -> Result<bool, BrowserError> {
         info!("Session {} searching Google for: {}", session.id, keyword);
 
-        // Extended selectors for Google search input (supports Arabic/RTL and different layouts)
-        let search_found = session.execute_js(r#"
+        // Find search input element position for CDP click (real mouse events)
+        let input_info = session.execute_js(r#"
             (function() {
                 const selectors = [
-                    'input[name="q"]',
                     'textarea[name="q"]',
+                    'input[name="q"]',
+                    '#APjFqb',
+                    '.gLFyf',
                     'input[type="text"][title*="Search"]',
                     'input[type="text"][title*="بحث"]',
                     'input[aria-label*="Search"]',
                     'input[aria-label*="بحث"]',
                     'textarea[aria-label*="Search"]',
-                    'textarea[aria-label*="بحث"]',
-                    '.gLFyf',
-                    '#APjFqb'
+                    'textarea[aria-label*="بحث"]'
                 ];
                 for (const sel of selectors) {
-                    const input = document.querySelector(sel);
-                    if (input && input.offsetParent !== null) {
-                        return true;
+                    const el = document.querySelector(sel);
+                    if (el && el.offsetParent !== null) {
+                        const rect = el.getBoundingClientRect();
+                        return {
+                            found: true,
+                            x: rect.left + rect.width / 2,
+                            y: rect.top + rect.height / 2,
+                            selector: sel
+                        };
                     }
                 }
-                return false;
+                return { found: false };
             })()
         "#).await?;
 
-        if search_found.as_bool() != Some(true) {
+        if input_info.get("found").and_then(|v| v.as_bool()) != Some(true) {
             warn!("Session {} could not find Google search input", session.id);
             return Ok(false);
         }
 
-        // Simplified typing with base64 encoded keyword
-        let b64_keyword = base64::engine::general_purpose::STANDARD.encode(keyword);
-        let type_script = format!(r#"
-            (async function() {{
-                // Find Google search input
-                const input = document.querySelector('input[name="q"], textarea[name="q"], .gLFyf, #APjFqb');
-                if (!input) return false;
+        let x = input_info.get("x").and_then(|v| v.as_f64()).unwrap_or(400.0);
+        let y = input_info.get("y").and_then(|v| v.as_f64()).unwrap_or(300.0);
 
-                // Focus and clear
-                input.focus();
-                input.click();
-                input.value = '';
+        // Move mouse towards the search input via CDP (isTrusted: true, physics-based bezier)
+        session.move_mouse_human(x, y).await.ok();
+        Self::random_delay(100, 200).await;
 
-                await new Promise(r => setTimeout(r, 100 + Math.random() * 100));
+        // Click the search input via CDP (isTrusted: true mouse press/release)
+        session.click_human_at(x, y).await?;
 
-                // Decode base64 keyword
-                const b64 = "{}";
-                const text = new TextDecoder().decode(Uint8Array.from(atob(b64), c => c.charCodeAt(0)));
-
-                // Type each character
-                for (let i = 0; i < text.length; i++) {{
-                    await new Promise(r => setTimeout(r, 30 + Math.random() * 70));
-                    input.value += text[i];
-                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        // Select any existing text in the input (so new typing replaces it)
+        session.execute_js(&format!(r#"
+            (function() {{
+                const el = document.elementFromPoint({}, {});
+                if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {{
+                    el.select();
                 }}
-
-                return true;
             }})()
-        "#, b64_keyword);
+        "#, x, y)).await.ok();
 
-        session.execute_js(&type_script).await?;
+        // Human thinking pause before typing (500-1500ms — like deciding what to type)
+        Self::random_delay(500, 1000).await;
 
-        // Wait before pressing enter
-        Self::random_delay(300, 600).await;
+        // Type keyword with realistic typos and variable speed (physics-based)
+        session.type_text_with_typos_cdp(keyword).await?;
 
-        // Press Enter to search
-        session.execute_js(r#"
-            (function() {
-                const input = document.querySelector('input[name="q"], textarea[name="q"]');
-                if (input) {
-                    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
-                    input.form?.submit();
+        // Review what was typed (800-2000ms — humans glance at their query)
+        Self::random_delay(800, 1200).await;
+
+        // Press Enter via CDP (real keyboard event, not JS dispatchEvent)
+        session.press_enter().await?;
+
+        // Wait for search results to load — poll for URL change instead of blind sleep
+        // The URL should change from google.com.sa/ to google.com.sa/search?q=...
+        let mut search_submitted = false;
+        for attempt in 0..12 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let url_check = session.execute_js(r#"window.location.href"#).await;
+            if let Ok(url_val) = url_check {
+                let url = url_val.as_str().unwrap_or("");
+                if url.contains("/search") || url.contains("q=") {
+                    debug!("Session {} search submitted (attempt {}, url: {})", session.id, attempt + 1, &url[..url.len().min(80)]);
+                    search_submitted = true;
+                    // Wait a bit more for results to render
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    break;
                 }
-            })()
-        "#).await?;
+            }
+        }
 
-        // Wait for search results to load
-        Self::random_delay(1500, 2500).await;
+        // Fallback: if Enter didn't submit, try JS form submit
+        if !search_submitted {
+            warn!("Session {} Enter key didn't submit search, trying JS form submit", session.id);
+            session.execute_js(r#"
+                (function() {
+                    // Try submitting the search form
+                    const form = document.querySelector('form[action="/search"]') ||
+                                 document.querySelector('form[role="search"]') ||
+                                 document.querySelector('form');
+                    if (form) {
+                        form.submit();
+                        return 'form_submitted';
+                    }
+                    // Fallback: click search button
+                    const btn = document.querySelector('input[name="btnK"]') ||
+                                document.querySelector('button[type="submit"]');
+                    if (btn) {
+                        btn.click();
+                        return 'button_clicked';
+                    }
+                    return 'no_form_found';
+                })()
+            "#).await?;
+
+            // Wait for results after fallback submit
+            tokio::time::sleep(Duration::from_millis(3000)).await;
+        }
 
         // Check for CAPTCHA after search
         if Self::check_google_captcha(session).await? {
@@ -920,8 +1045,8 @@ impl BrowserActions {
         let has_captcha = page_info.get("hasCaptcha").and_then(|v| v.as_bool()).unwrap_or(false);
         let has_no_results = page_info.get("hasNoResults").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        debug!("Session {} search page state: url={}, title={}",
-            session.id, &url[..url.len().min(80)], &title[..title.len().min(50)]);
+        info!("Session {} search page: url={}, title={}",
+            session.id, &url[..url.len().min(100)], &title[..title.len().min(50)]);
         info!("Session {} search results: {} organic, {} top ads, {} grintahub links, captcha={}, noResults={}",
             session.id, result_count, top_ad_count, grinta_count, has_captcha, has_no_results);
 
@@ -937,103 +1062,101 @@ impl BrowserActions {
         Ok(result_count > 0)
     }
 
-    /// Find and click on grintahub.com SPONSORED AD in Google results
-    pub async fn click_grintahub_result(session: &Arc<BrowserSession>) -> Result<bool, BrowserError> {
-        info!("Session {} looking for grintahub.com in SPONSORED ADS", session.id);
-
-        // Quick scroll to see ads
+    /// Helper function to scan for grintahub ads on the page
+    /// Find grintahub ad AND click it in a single JS execution.
+    /// Returns { clicked: bool, count: int, type: str, debug: {} }
+    /// This avoids the DOM-state-change bug where scan finds ads but a separate click call can't.
+    async fn find_and_click_grintahub_ad(session: &Arc<BrowserSession>) -> Result<serde_json::Value, BrowserError> {
         session.execute_js(r#"
-            (async function() {
-                await new Promise(r => setTimeout(r, 150 + Math.random() * 200));
-                window.scrollBy({ top: 150 + Math.random() * 200, behavior: 'smooth' });
-            })()
-        "#).await?;
-
-        Self::random_delay(200, 400).await;
-
-        // Find grintahub.com links in SPONSORED ADS only
-        let find_result = session.execute_js(r#"
             (function() {
                 const grintaAdLinks = [];
 
-                // Method 1: Find ads in top ads section (#tads)
-                const topAds = document.querySelectorAll('#tads a[href], #tadsb a[href]');
-                for (const link of topAds) {
+                // Helper: check if href is grintahub
+                function isGrinta(href) {
+                    return href.includes('grintahub.com') || href.includes('grintahub');
+                }
+                function notGoogle(href) {
+                    return !href.includes('google.com');
+                }
+                function collectLinks(selector, type) {
+                    const links = document.querySelectorAll(selector);
+                    for (const link of links) {
+                        const href = link.getAttribute('href') || '';
+                        if (isGrinta(href) && notGoogle(href)) {
+                            grintaAdLinks.push({ el: link, href, type,
+                                text: (link.innerText || link.textContent || '').substring(0, 100),
+                                y: link.getBoundingClientRect().top
+                            });
+                        }
+                    }
+                }
+
+                // Method 1: Top ads (#tads)
+                collectLinks('#tads a[href]', 'top_ad');
+
+                // Method 2: Bottom ads (#tadsb)
+                collectLinks('#tadsb a[href], #bottomads a[href], [id*="bottomads"] a[href]', 'bottom_ad');
+
+                // Method 3: data-text-ad
+                collectLinks('[data-text-ad] a[href]', 'text_ad');
+
+                // Method 4: googleadservices.com redirect
+                const adServiceLinks = document.querySelectorAll('a[href*="googleadservices.com"], a[href*="aclk"]');
+                for (const link of adServiceLinks) {
                     const href = link.getAttribute('href') || '';
-                    if (href.includes('grintahub.com') || href.includes('grintahub')) {
-                        grintaAdLinks.push({
-                            element: link,
-                            href: href,
-                            text: link.innerText || link.textContent,
-                            type: 'top_ad'
+                    if (isGrinta(href)) {
+                        grintaAdLinks.push({ el: link, href, type: 'adservice',
+                            text: (link.innerText || link.textContent || '').substring(0, 100),
+                            y: link.getBoundingClientRect().top
                         });
                     }
                 }
 
-                // Method 2: Find ads with data-text-ad attribute
-                const textAds = document.querySelectorAll('[data-text-ad] a[href]');
-                for (const link of textAds) {
-                    const href = link.getAttribute('href') || '';
-                    if (href.includes('grintahub.com') || href.includes('grintahub')) {
-                        grintaAdLinks.push({
-                            element: link,
-                            href: href,
-                            text: link.innerText || link.textContent,
-                            type: 'text_ad'
-                        });
-                    }
-                }
-
-                // Method 3: Find ads by "Sponsored" label proximity
-                const sponsoredLabels = document.querySelectorAll('[aria-label*="Sponsored"], [data-dtld], .uEierd, .x54gtf');
+                // Method 5: Sponsored labels (most comprehensive)
+                const sponsoredLabels = document.querySelectorAll(
+                    '[aria-label*="Sponsored"], [aria-label*="إعلان"], [data-dtld], .uEierd, .x54gtf'
+                );
                 for (const label of sponsoredLabels) {
-                    const parent = label.closest('div[data-hveid]') || label.parentElement?.parentElement?.parentElement;
+                    const parent = label.closest('div[data-hveid]') || label.closest('div[data-text-ad]') ||
+                                  label.parentElement?.parentElement?.parentElement?.parentElement;
                     if (parent) {
                         const links = parent.querySelectorAll('a[href]');
                         for (const link of links) {
                             const href = link.getAttribute('href') || '';
-                            if ((href.includes('grintahub.com') || href.includes('grintahub')) && !href.includes('google.com')) {
-                                grintaAdLinks.push({
-                                    element: link,
-                                    href: href,
-                                    text: link.innerText || link.textContent,
-                                    type: 'sponsored_label'
+                            if (isGrinta(href) && notGoogle(href)) {
+                                grintaAdLinks.push({ el: link, href, type: 'sponsored',
+                                    text: (link.innerText || link.textContent || '').substring(0, 100),
+                                    y: link.getBoundingClientRect().top
                                 });
                             }
                         }
                     }
                 }
 
-                // Method 4: Find ads with googleadservices.com redirect
-                const allLinks = document.querySelectorAll('a[href*="googleadservices.com"]');
-                for (const link of allLinks) {
-                    const href = link.getAttribute('href') || '';
-                    if (href.includes('grintahub')) {
-                        grintaAdLinks.push({
-                            element: link,
-                            href: href,
-                            text: link.innerText || link.textContent,
-                            type: 'googleadservices'
-                        });
-                    }
-                }
-
-                // Method 5: Look for ads container with class patterns
-                const adContainers = document.querySelectorAll('.ads-ad, .commercial-unit-desktop-top, [data-sokoban-container]');
-                for (const container of adContainers) {
-                    const links = container.querySelectorAll('a[href]');
-                    for (const link of links) {
-                        const href = link.getAttribute('href') || '';
-                        if ((href.includes('grintahub.com') || href.includes('grintahub')) && !href.includes('google.com')) {
-                            grintaAdLinks.push({
-                                element: link,
-                                href: href,
-                                text: link.innerText || link.textContent,
-                                type: 'ad_container'
-                            });
+                // Method 6: Also check spans with "Sponsored" / "إعلان" text
+                const allSpans = document.querySelectorAll('span');
+                for (const span of allSpans) {
+                    const txt = (span.innerText || '').trim().toLowerCase();
+                    if (txt === 'sponsored' || txt === 'إعلان' || txt === 'ad') {
+                        const parent = span.closest('div[data-hveid]') || span.closest('div[data-text-ad]') ||
+                                      span.parentElement?.parentElement?.parentElement?.parentElement?.parentElement;
+                        if (parent) {
+                            const links = parent.querySelectorAll('a[href]');
+                            for (const link of links) {
+                                const href = link.getAttribute('href') || '';
+                                if (isGrinta(href) && notGoogle(href)) {
+                                    grintaAdLinks.push({ el: link, href, type: 'span_sponsored',
+                                        text: (link.innerText || link.textContent || '').substring(0, 100),
+                                        y: link.getBoundingClientRect().top
+                                    });
+                                }
+                            }
                         }
                     }
                 }
+
+                // Method 7: Ad container classes
+                collectLinks('.ads-ad a[href], .commercial-unit-desktop-top a[href], [data-sokoban-container] a[href], .cu-container a[href]', 'ad_container');
 
                 // Deduplicate by href
                 const seen = new Set();
@@ -1043,167 +1166,145 @@ impl BrowserActions {
                     return true;
                 });
 
+                // Debug info
+                const debug = {
+                    hasTopAds: !!document.querySelector('#tads'),
+                    hasBottomAds: !!document.querySelector('#tadsb, #bottomads'),
+                    totalAdElements: document.querySelectorAll('[data-text-ad], [data-hveid]').length,
+                    hasSponsoredText: document.body.innerText.includes('Sponsored') || document.body.innerText.includes('إعلان'),
+                    scrollY: window.scrollY,
+                    pageHeight: document.body.scrollHeight
+                };
+
                 if (uniqueLinks.length === 0) {
-                    return { found: false, count: 0, isAd: true };
+                    return { clicked: false, count: 0, debug };
                 }
 
-                // Pick the first ad (most prominent position)
+                // Sort by position (highest on page first)
+                uniqueLinks.sort((a, b) => a.y - b.y);
                 const chosen = uniqueLinks[0];
 
-                // Scroll to the ad link
-                chosen.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                // === PREPARE THE AD FOR CDP CLICK ===
+                // Scroll ad into view
+                chosen.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+                // Remove target="_blank" to stay in same tab
+                chosen.el.removeAttribute('target');
+                chosen.el.setAttribute('target', '_self');
+
+                // Wait for scroll to finish, then get final coordinates
+                await new Promise(r => setTimeout(r, 400));
+                const finalRect = chosen.el.getBoundingClientRect();
 
                 return {
-                    found: true,
+                    clicked: false,
+                    ready_for_cdp_click: true,
                     count: uniqueLinks.length,
-                    chosenIndex: 0,
-                    href: chosen.href,
                     type: chosen.type,
-                    isAd: true
+                    href: chosen.href,
+                    text: chosen.text,
+                    x: finalRect.left + finalRect.width / 2,
+                    y: finalRect.top + finalRect.height / 2,
+                    debug
                 };
             })()
-        "#).await?;
+        "#).await
+    }
 
-        let found = find_result.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
-
-        if !found {
-            // Get more debug info about why no ads were found
-            let debug_info = session.execute_js(r#"
-                (function() {
-                    const url = window.location.href;
-                    const topAdsContainer = document.querySelector('#tads, #tadsb');
-                    const allAds = document.querySelectorAll('[data-text-ad], [data-hveid]');
-                    const sponsoredText = document.body.innerText.includes('Sponsored') ||
-                                         document.body.innerText.includes('إعلان') ||
-                                         document.body.innerText.includes('Ad');
-                    const allLinks = document.querySelectorAll('a[href]');
-                    const grintaAnywhere = Array.from(allLinks).filter(l =>
-                        (l.href || '').toLowerCase().includes('grintahub')
-                    );
-
-                    return {
-                        url: url,
-                        hasTopAdsContainer: !!topAdsContainer,
-                        totalAdElements: allAds.length,
-                        hasSponsoredText: sponsoredText,
-                        totalLinks: allLinks.length,
-                        grintaLinksAnywhere: grintaAnywhere.length,
-                        grintaUrls: grintaAnywhere.slice(0, 5).map(l => l.href)
-                    };
-                })()
-            "#).await.unwrap_or_default();
-
-            let has_top_ads = debug_info.get("hasTopAdsContainer").and_then(|v| v.as_bool()).unwrap_or(false);
-            let total_ads = debug_info.get("totalAdElements").and_then(|v| v.as_u64()).unwrap_or(0);
-            let has_sponsored = debug_info.get("hasSponsoredText").and_then(|v| v.as_bool()).unwrap_or(false);
-            let grinta_anywhere = debug_info.get("grintaLinksAnywhere").and_then(|v| v.as_u64()).unwrap_or(0);
-
-            warn!("Session {} NO grintahub.com SPONSORED ADS - hasTopAds={}, totalAdElements={}, hasSponsoredText={}, grintaLinksAnywhere={}",
-                session.id, has_top_ads, total_ads, has_sponsored, grinta_anywhere);
-
-            if grinta_anywhere > 0 {
-                let urls = debug_info.get("grintaUrls").and_then(|v| v.as_array());
-                if let Some(urls) = urls {
-                    warn!("Session {} grintahub links found (but not in ad sections): {:?}",
-                        session.id, urls.iter().take(3).collect::<Vec<_>>());
-                }
-            }
-
+    /// Perform CDP mouse movement + click on an ad found by find_and_click_grintahub_ad.
+    /// Returns true if the CDP click was performed, false if the result didn't have coordinates.
+    async fn cdp_click_ad(session: &Arc<BrowserSession>, result: &serde_json::Value, phase: &str) -> Result<bool, BrowserError> {
+        let ready = result.get("ready_for_cdp_click").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !ready {
             return Ok(false);
         }
 
-        let count = find_result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let ad_type = find_result.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-        info!("Session {} found {} grintahub SPONSORED ADS (type: {})", session.id, count, ad_type);
+        let x = result.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let y = result.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ad_type = result.get("type").and_then(|v| v.as_str()).unwrap_or("?");
 
-        // Wait after scrolling
-        Self::random_delay(200, 400).await;
+        // CDP mouse movement to ad (physics-based bezier, isTrusted: true)
+        session.move_mouse_human(x, y).await.ok();
+        Self::random_delay(100, 200).await;
 
-        // Click the AD link with human-like behavior
-        let clicked = session.execute_js(r#"
-            (function() {
-                const grintaAdLinks = [];
+        // CDP click on the ad (isTrusted: true)
+        session.click_human_at(x, y).await?;
 
-                // Collect all ad links (same logic as above)
-                const topAds = document.querySelectorAll('#tads a[href], #tadsb a[href]');
-                for (const link of topAds) {
-                    const href = link.getAttribute('href') || '';
-                    if (href.includes('grintahub.com') || href.includes('grintahub')) {
-                        grintaAdLinks.push(link);
-                    }
-                }
+        info!("Session {} CLICKED grintahub ad {} ({} found, type: {})", session.id, phase, count, ad_type);
+        Self::random_delay(1500, 2500).await; // Wait for navigation
+        Ok(true)
+    }
 
-                const textAds = document.querySelectorAll('[data-text-ad] a[href]');
-                for (const link of textAds) {
-                    const href = link.getAttribute('href') || '';
-                    if (href.includes('grintahub.com') || href.includes('grintahub')) {
-                        grintaAdLinks.push(link);
-                    }
-                }
+    /// Find and click on grintahub.com SPONSORED AD in Google results.
+    /// Uses 4-phase search: top → scroll down → bottom → back to top.
+    /// JS finds the ad and returns coordinates, then CDP performs the click
+    /// with isTrusted: true mouse events (critical for Google ad fraud detection).
+    pub async fn click_grintahub_result(session: &Arc<BrowserSession>) -> Result<bool, BrowserError> {
+        info!("Session {} looking for grintahub.com in SPONSORED ADS", session.id);
 
-                const sponsoredLabels = document.querySelectorAll('[aria-label*="Sponsored"], [data-dtld], .uEierd, .x54gtf');
-                for (const label of sponsoredLabels) {
-                    const parent = label.closest('div[data-hveid]') || label.parentElement?.parentElement?.parentElement;
-                    if (parent) {
-                        const links = parent.querySelectorAll('a[href]');
-                        for (const link of links) {
-                            const href = link.getAttribute('href') || '';
-                            if ((href.includes('grintahub.com') || href.includes('grintahub')) && !href.includes('google.com')) {
-                                grintaAdLinks.push(link);
-                            }
-                        }
-                    }
-                }
+        // ========== PHASE 1: Check TOP of page first (most ads are here) ==========
+        debug!("Session {} Phase 1: Checking top of page for ads...", session.id);
 
-                const googleAdLinks = document.querySelectorAll('a[href*="googleadservices.com"]');
-                for (const link of googleAdLinks) {
-                    const href = link.getAttribute('href') || '';
-                    if (href.includes('grintahub')) {
-                        grintaAdLinks.push(link);
-                    }
-                }
+        // Brief pause to "read" initial results
+        Self::random_delay(800, 1200).await;
 
-                const adContainers = document.querySelectorAll('.ads-ad, .commercial-unit-desktop-top, [data-sokoban-container]');
-                for (const container of adContainers) {
-                    const links = container.querySelectorAll('a[href]');
-                    for (const link of links) {
-                        const href = link.getAttribute('href') || '';
-                        if ((href.includes('grintahub.com') || href.includes('grintahub')) && !href.includes('google.com')) {
-                            grintaAdLinks.push(link);
-                        }
-                    }
-                }
-
-                if (grintaAdLinks.length === 0) return false;
-
-                // Click the first (most prominent) ad
-                const link = grintaAdLinks[0];
-
-                // Remove target="_blank" to prevent opening in new tab
-                link.removeAttribute('target');
-                link.setAttribute('target', '_self');
-
-                // Simulate mouse events for realistic click
-                link.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-                link.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-
-                setTimeout(() => {
-                    link.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                    link.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                    link.click();
-                }, 150);
-
-                return true;
-            })()
-        "#).await?;
-
-        if clicked.as_bool() == Some(true) {
-            session.increment_clicks();
-            info!("Session {} clicked on grintahub.com result", session.id);
-            // Wait for page navigation
-            Self::random_delay(1500, 2500).await;
+        let result = Self::find_and_click_grintahub_ad(session).await?;
+        if Self::cdp_click_ad(session, &result, "at TOP").await? {
             return Ok(true);
         }
+
+        // ========== PHASE 2: Scroll down slowly checking after each scroll ==========
+        debug!("Session {} Phase 2: Scrolling down to find ads...", session.id);
+
+        for step in 0..4 {
+            let scroll_amount = 300 + rand::thread_rng().gen_range(0..200);
+            session.execute_js(&format!(
+                "window.scrollBy({{ top: {}, behavior: 'smooth' }})", scroll_amount
+            )).await?;
+
+            // Wait for scroll + dynamic content to load
+            Self::random_delay(700, 1100).await;
+
+            let result = Self::find_and_click_grintahub_ad(session).await?;
+            if Self::cdp_click_ad(session, &result, &format!("after scroll {}", step + 1)).await? {
+                return Ok(true);
+            }
+        }
+
+        // ========== PHASE 3: Jump to bottom for bottom ads ==========
+        debug!("Session {} Phase 3: Checking bottom of page...", session.id);
+
+        session.execute_js(r#"
+            window.scrollTo({ top: document.body.scrollHeight - window.innerHeight - 50, behavior: 'smooth' })
+        "#).await?;
+
+        Self::random_delay(800, 1200).await;
+
+        let result = Self::find_and_click_grintahub_ad(session).await?;
+        if Self::cdp_click_ad(session, &result, "at BOTTOM").await? {
+            return Ok(true);
+        }
+
+        // ========== PHASE 4: Scroll back to top for final check ==========
+        debug!("Session {} Phase 4: Back to top for final check...", session.id);
+
+        session.execute_js("window.scrollTo({ top: 0, behavior: 'smooth' })").await?;
+        Self::random_delay(600, 900).await;
+
+        let result = Self::find_and_click_grintahub_ad(session).await?;
+        if Self::cdp_click_ad(session, &result, "on FINAL scan").await? {
+            return Ok(true);
+        }
+
+        // ========== NO ADS FOUND ==========
+        let debug_info = result.get("debug").cloned().unwrap_or_default();
+        let has_top = debug_info.get("hasTopAds").and_then(|v| v.as_bool()).unwrap_or(false);
+        let has_bottom = debug_info.get("hasBottomAds").and_then(|v| v.as_bool()).unwrap_or(false);
+        let total_ads = debug_info.get("totalAdElements").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        warn!("Session {} NO grintahub ads found (topAds={}, bottomAds={}, adElements={})",
+            session.id, has_top, has_bottom, total_ads);
 
         Ok(false)
     }
@@ -1219,21 +1320,33 @@ impl BrowserActions {
 
         Self::random_delay(500, 1000).await;
 
-        // Click next page
-        let has_next = session.execute_js(r#"
+        // Find next page button and get coordinates
+        let next_info = session.execute_js(r#"
             (function() {
                 const next = document.querySelector('#pnnext, a[aria-label="Next page"], a[id="pnnext"]');
                 if (next) {
-                    // Prevent opening in new tab
                     next.removeAttribute('target');
-                    next.click();
-                    return true;
+                    next.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    const rect = next.getBoundingClientRect();
+                    return {
+                        found: true,
+                        x: rect.left + rect.width / 2,
+                        y: rect.top + rect.height / 2
+                    };
                 }
-                return false;
+                return { found: false };
             })()
         "#).await?;
 
-        if has_next.as_bool() == Some(true) {
+        if next_info.get("found").and_then(|v| v.as_bool()) == Some(true) {
+            let nx = next_info.get("x").and_then(|v| v.as_f64()).unwrap_or(400.0);
+            let ny = next_info.get("y").and_then(|v| v.as_f64()).unwrap_or(400.0);
+
+            // CDP mouse movement + click (isTrusted: true)
+            Self::random_delay(200, 400).await;
+            session.move_mouse_human(nx, ny).await.ok();
+            Self::random_delay(100, 200).await;
+            session.click_human_at(nx, ny).await?;
             Self::random_delay(1500, 2500).await;
 
             // Check for CAPTCHA after navigating to next page
@@ -1275,35 +1388,32 @@ impl BrowserActions {
         // Maybe click on something on the page (40% chance)
         let should_click = rand::thread_rng().gen_bool(0.4);
         if should_click {
-            {
+            // Find a random link and get its coordinates (JS only finds, doesn't click)
+            let link_info = session.execute_js(r#"
+                (async function() {
+                    const links = document.querySelectorAll('a[href*="/ads/"], a[href*="/listing/"], .card a, .item a');
+                    if (links.length === 0) return { found: false };
+                    const randomLink = links[Math.floor(Math.random() * links.length)];
+                    randomLink.removeAttribute('target');
+                    randomLink.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    await new Promise(r => setTimeout(r, 400));
+                    const rect = randomLink.getBoundingClientRect();
+                    return {
+                        found: true,
+                        x: rect.left + rect.width / 2,
+                        y: rect.top + rect.height / 2
+                    };
+                })()
+            "#).await?;
 
-                session.execute_js(r#"
-                    (async function() {
-                        // Find clickable links
-                        const links = document.querySelectorAll('a[href*="/ads/"], a[href*="/listing/"], .card a, .item a');
-                        if (links.length > 0) {
-                            const randomLink = links[Math.floor(Math.random() * links.length)];
+            if link_info.get("found").and_then(|v| v.as_bool()) == Some(true) {
+                let lx = link_info.get("x").and_then(|v| v.as_f64()).unwrap_or(400.0);
+                let ly = link_info.get("y").and_then(|v| v.as_f64()).unwrap_or(300.0);
 
-                            // Prevent opening in new tab
-                            randomLink.removeAttribute('target');
-
-                            randomLink.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-                            await new Promise(r => setTimeout(r, 300 + Math.random() * 300));
-
-                            // Hover then click
-                            randomLink.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-                            randomLink.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-
-                            await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
-
-                            randomLink.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-                            await new Promise(r => setTimeout(r, 50 + Math.random() * 50));
-                            randomLink.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-                            randomLink.click();
-                        }
-                    })()
-                "#).await?;
+                // CDP mouse movement + click (isTrusted: true)
+                session.move_mouse_human(lx, ly).await.ok();
+                Self::random_delay(100, 200).await;
+                session.click_human_at(lx, ly).await.ok();
 
                 Self::random_delay(1000, 2000).await;
 
@@ -1420,14 +1530,7 @@ impl BrowserActions {
                         await new Promise(r => setTimeout(r, 500 + Math.random() * 1000));
                     }
 
-                    // Random mouse movement while reading
-                    if (Math.random() < 0.3) {
-                        const x = window.innerWidth * (0.2 + Math.random() * 0.6);
-                        const y = window.innerHeight * (0.3 + Math.random() * 0.4);
-                        document.dispatchEvent(new MouseEvent('mousemove', {
-                            clientX: x, clientY: y, bubbles: true
-                        }));
-                    }
+                    // Mouse movements are handled via CDP (isTrusted: true) outside this scroll loop
                 }
 
                 // Maybe scroll back to top at end (20% chance)
@@ -1516,11 +1619,11 @@ impl BrowserActions {
             }
             let browse_elapsed = browse_start.elapsed().as_millis() as u64;
 
-            // 5. CRITICAL: Dwell time on landing page (20-40 seconds total)
+            // 5. CRITICAL: Dwell time on landing page (60-180 seconds total)
             // Google flags clicks as invalid if dwell time is too short.
-            // The page is still open in the browser even if CDP context is lost.
-            let min_dwell_ms: u64 = 20_000;
-            let max_dwell_ms: u64 = 40_000;
+            // Real users spend 1-3 minutes browsing a page.
+            let min_dwell_ms: u64 = 60_000;
+            let max_dwell_ms: u64 = 180_000;
             let target_dwell = {
                 let mut rng = rand::thread_rng();
                 rng.gen_range(min_dwell_ms..=max_dwell_ms)
@@ -1590,5 +1693,174 @@ impl BrowserActions {
 
         // Now run the regular cycle
         Self::run_cycle(session, keyword, min_delay_ms, max_delay_ms).await
+    }
+
+    // =================== TRUST-BUILDING FUNCTIONS ===================
+
+    /// Lightweight warm-up sites (no heavy ad networks, low bandwidth)
+    const WARMUP_SITES: &'static [&'static str] = &[
+        "https://en.wikipedia.org",
+        "https://www.timeanddate.com",
+        "https://stackoverflow.com",
+    ];
+
+    /// Organic search queries (Saudi-relevant, natural mix)
+    const ORGANIC_QUERIES: &'static [&'static str] = &[
+        "weather riyadh",
+        "prayer times riyadh",
+        "usd to sar",
+        "saudi arabia news",
+        "best restaurants jeddah",
+        "riyadh events",
+        "football scores today",
+        "kabsa recipe",
+        "saudi vision 2030",
+        "jeddah airport flights",
+        "riyadh mall hours",
+        "eid holidays saudi",
+    ];
+
+    /// Warm-up session before first Google search.
+    /// Builds trust by visiting Google (gets NID/CONSENT cookies) and
+    /// browsing 1-2 lightweight sites. Ad tracker domains are already
+    /// blocked in block_unnecessary_resources().
+    pub async fn warm_up_session(session: &Arc<BrowserSession>) -> Result<(), BrowserError> {
+        info!("Session {} starting warm-up phase (build trust before searching)", session.id);
+
+        // Phase 1: Visit Google first to get NID/CONSENT cookies
+        session.navigate("https://www.google.com.sa/").await?;
+        Self::human_delay(2500, 1500).await;
+
+        // Handle consent dialog (reuses the same consent handling as goto_google)
+        let consent_result = session.execute_js(r#"
+            (async function() {
+                await new Promise(r => setTimeout(r, 1000));
+                const selectors = [
+                    'button[id*="L2AGLb"]', 'button[id*="accept"]', 'button[id*="agree"]',
+                    '[aria-label*="Accept"]', '[aria-label*="agree"]',
+                    '[aria-label*="قبول"]', '[aria-label*="موافق"]',
+                    '.tHlp8d', '#introAgreeButton', 'button.VfPpkd-LgbsSe',
+                    'form[action*="consent"] button', 'button.VfPpkd-LgbsSe-OWXEXe-k8QpJ'
+                ];
+                for (const sel of selectors) {
+                    try {
+                        const btns = document.querySelectorAll(sel);
+                        for (const btn of btns) {
+                            if (btn.offsetParent !== null && btn.offsetWidth > 0) {
+                                btn.click();
+                                await new Promise(r => setTimeout(r, 500));
+                                return 'clicked';
+                            }
+                        }
+                    } catch(e) {}
+                }
+                return 'no_consent';
+            })()
+        "#).await;
+        debug!("Session {} warm-up consent: {:?}", session.id, consent_result);
+        Self::human_delay(800, 400).await;
+
+        // Verify Google cookies
+        let cookies = session.execute_js(r#"
+            (function() {
+                const c = document.cookie;
+                return { hasNID: c.includes('NID'), hasCONSENT: c.includes('CONSENT'), len: c.length };
+            })()
+        "#).await;
+        if let Ok(ref v) = cookies {
+            debug!("Session {} Google cookies after warm-up: {:?}", session.id, v);
+        }
+
+        // Phase 2: Browse 1-2 lightweight sites (ad trackers already blocked)
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let warmup_count = rng.gen_range(1..=2);
+
+        let mut indices: Vec<usize> = (0..Self::WARMUP_SITES.len()).collect();
+        // Simple shuffle
+        for i in (1..indices.len()).rev() {
+            let j = rng.gen_range(0..=i);
+            indices.swap(i, j);
+        }
+
+        for i in 0..warmup_count {
+            let site = Self::WARMUP_SITES[indices[i]];
+            info!("Session {} warm-up: visiting {} ({}/{})", session.id, site, i + 1, warmup_count);
+
+            if let Err(e) = session.navigate(site).await {
+                debug!("Session {} warm-up nav to {} failed (non-fatal): {}", session.id, site, e);
+                continue;
+            }
+
+            // Brief "reading" behavior
+            Self::human_delay(3000, 3000).await;
+            let _ = session.scroll_human(200 + rng.gen_range(0..300) as i32).await;
+            Self::human_delay(1000, 2000).await;
+        }
+
+        info!("Session {} warm-up complete — ready for Google search", session.id);
+        Ok(())
+    }
+
+    /// Do an organic Google search (not for grintahub).
+    /// Builds search history to make session look like a real user.
+    /// 30% chance of clicking an organic result.
+    pub async fn organic_search(session: &Arc<BrowserSession>) -> Result<(), BrowserError> {
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let query = Self::ORGANIC_QUERIES[rng.gen_range(0..Self::ORGANIC_QUERIES.len())];
+
+        info!("Session {} organic search: \"{}\"", session.id, query);
+
+        // Navigate to Google (consent already handled during warm-up)
+        session.navigate("https://www.google.com.sa/").await?;
+        Self::human_delay(1500, 1000).await;
+
+        // Do the search using existing google_search flow
+        match Self::google_search(session, query).await {
+            Ok(_has_results) => {
+                // Scroll through results like a real user
+                Self::human_delay(1500, 1500).await;
+                let _ = Self::human_scroll_read(session).await;
+                Self::human_delay(1000, 2000).await;
+
+                // 30% chance: click a random organic result (NOT grintahub, NOT ads)
+                if rng.gen_bool(0.3) {
+                    let result = session.execute_js(r#"
+                        (function() {
+                            const links = document.querySelectorAll('#search a[href]:not([href*="grintahub"]):not([href*="googleadservices"])');
+                            const visible = [...links].filter(l => l.offsetParent !== null && l.getBoundingClientRect().top > 0);
+                            if (visible.length === 0) return { found: false };
+                            const idx = Math.floor(Math.random() * Math.min(5, visible.length));
+                            const chosen = visible[idx];
+                            chosen.removeAttribute('target');
+                            chosen.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            const rect = chosen.getBoundingClientRect();
+                            return { found: true, x: rect.left + rect.width/2, y: rect.top + rect.height/2, text: chosen.textContent.substring(0, 50) };
+                        })()
+                    "#).await;
+
+                    if let Ok(ref v) = result {
+                        if v.get("found").and_then(|v| v.as_bool()) == Some(true) {
+                            let x = v.get("x").and_then(|v| v.as_f64()).unwrap_or(400.0);
+                            let y = v.get("y").and_then(|v| v.as_f64()).unwrap_or(300.0);
+                            let text = v.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            debug!("Session {} organic click: \"{}\" at ({}, {})", session.id, text, x, y);
+                            let _ = session.click_human_at(x, y).await;
+                            Self::human_delay(4000, 6000).await; // Browse the result briefly
+                        }
+                    }
+                }
+            }
+            Err(BrowserError::CaptchaDetected(msg)) => {
+                // CAPTCHA during organic search — don't propagate, just log and return
+                warn!("Session {} organic search hit CAPTCHA: {}", session.id, msg);
+                return Err(BrowserError::CaptchaDetected(msg));
+            }
+            Err(e) => {
+                debug!("Session {} organic search failed (non-fatal): {}", session.id, e);
+            }
+        }
+
+        info!("Session {} organic search complete", session.id);
+        Ok(())
     }
 }

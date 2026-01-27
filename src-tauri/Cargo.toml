@@ -7,6 +7,7 @@ license = "MIT"
 repository = ""
 edition = "2021"
 rust-version = "1.77.2"
+default-run = "grintahub-clicker"
 
 [lib]
 name = "app_lib"
@@ -44,8 +45,8 @@ tokio = { version = "1", features = ["full"] }
 # HTTP client with proxy support
 reqwest = { version = "0.12", features = ["json", "socks", "rustls-tls", "cookies", "gzip", "brotli"] }
 
-# Browser automation
-chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+# Browser automation (chaser-oxide = chromiumoxide fork with protocol-level stealth)
+chaser-oxide = { git = "https://github.com/ccheshirecat/chaser-oxide", features = ["tokio-runtime"], default-features = false }
 futures = "0.3"
 
 # Concurrency

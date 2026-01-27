@@ -7,14 +7,36 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{info, debug};
-use chromiumoxide::{Browser, BrowserConfig, Page};
+use tracing::{info, warn, debug};
+use chaser_oxide::{Browser, BrowserConfig, Page};
+use chaser_oxide::chaser::ChaserPage;
+use chaser_oxide::profiles::{ChaserProfile, Gpu};
 use futures::StreamExt;
 use uuid::Uuid;
 use rand::Rng;
 
 use super::BrowserError;
 use crate::proxy::LocalProxyForwarder;
+
+/// Detect the major Chrome version from the installed binary.
+/// Returns (major_version, full_version_string) e.g. (142, "142.0.7444.175")
+fn detect_chrome_version() -> Option<(u32, String)> {
+    let chrome_path = find_chrome()?;
+    let output = std::process::Command::new(&chrome_path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let version_str = String::from_utf8_lossy(&output.stdout);
+    // Parse "Google Chrome 142.0.7444.175" or "Chromium 142.0.7444.175"
+    let full_ver = version_str
+        .split_whitespace()
+        .find(|s| s.contains('.'))?
+        .trim()
+        .to_string();
+    let major: u32 = full_ver.split('.').next()?.parse().ok()?;
+    info!("Detected Chrome version: {} (major: {})", full_ver, major);
+    Some((major, full_ver))
+}
 
 /// Find Chrome/Chromium executable on the system
 fn find_chrome() -> Option<std::path::PathBuf> {
@@ -33,69 +55,35 @@ fn find_chrome() -> Option<std::path::PathBuf> {
             std::path::PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
         ]
     } else {
+        // Chromium MUST come first: Google Chrome blocks --load-extension
+        // (chrome/browser/extensions/extension_service.cc: "not allowed in Google Chrome")
+        // Chromium allows loading unpacked extensions, which we need for 2Captcha solver
         vec![
-            std::path::PathBuf::from("/usr/bin/google-chrome"),
-            std::path::PathBuf::from("/usr/bin/google-chrome-stable"),
             std::path::PathBuf::from("/usr/bin/chromium"),
             std::path::PathBuf::from("/usr/bin/chromium-browser"),
+            std::path::PathBuf::from("/usr/bin/google-chrome"),
+            std::path::PathBuf::from("/usr/bin/google-chrome-stable"),
         ]
     };
 
     candidates.into_iter().find(|p| p.exists())
 }
 
-/// Rotating user-agents pool - realistic Chrome/Edge on Windows
-const USER_AGENTS: &[&str] = &[
-    // Chrome on Windows (most common)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    // Edge on Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
-    // Chrome on macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    // Chrome on Linux
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-];
-
-/// Get a random user-agent
-fn get_random_user_agent() -> &'static str {
-    let idx = rand::thread_rng().gen_range(0..USER_AGENTS.len());
-    USER_AGENTS[idx]
-}
-
-/// Extract the major Chrome version from a user-agent string
-/// e.g., "...Chrome/131.0.0.0..." → "131"
-fn extract_chrome_version(ua: &str) -> &str {
-    if let Some(pos) = ua.find("Chrome/") {
-        let after = &ua[pos + 7..];
-        if let Some(dot_pos) = after.find('.') {
-            return &after[..dot_pos];
-        }
-    }
-    "131" // fallback
-}
-
-/// Extract the platform from a user-agent string
-fn extract_platform(ua: &str) -> &str {
-    if ua.contains("Windows") {
-        "Windows"
-    } else if ua.contains("Macintosh") {
-        "macOS"
-    } else if ua.contains("Linux") {
-        "Linux"
-    } else {
-        "Windows"
-    }
-}
-
-/// Check if the user-agent is Edge
-fn is_edge_ua(ua: &str) -> bool {
-    ua.contains("Edg/")
+/// Create a ChaserProfile configured for Saudi Arabia
+/// Uses Linux profile to match the actual host OS — avoids platform mismatch detection.
+/// ChaserProfile::windows() was causing Google to detect inconsistency between
+/// the claimed Windows platform and the actual Linux TLS/font/header signatures.
+/// Chrome version is auto-detected from the installed binary for consistency.
+fn create_saudi_profile(chrome_major: u32) -> ChaserProfile {
+    ChaserProfile::linux()
+        .chrome_version(chrome_major)
+        .gpu(Gpu::NvidiaGTX1660) // Single GPU — no rotation (reduces fingerprint entropy)
+        .memory_gb(8)
+        .cpu_cores(8)
+        .locale("ar-SA")
+        .timezone("Asia/Riyadh")
+        .screen(1920, 1080)
+        .build()
 }
 
 /// Configuration for a browser session
@@ -116,6 +104,8 @@ pub struct BrowserSessionConfig {
     pub window_width: u32,
     /// Window height
     pub window_height: u32,
+    /// Path to the 2Captcha solver extension directory (unpacked)
+    pub captcha_extension_dir: Option<String>,
 }
 
 impl Default for BrowserSessionConfig {
@@ -128,6 +118,7 @@ impl Default for BrowserSessionConfig {
             timeout_secs: 60, // Increased from 30 to 60 seconds for slow proxy connections
             window_width: 1920,
             window_height: 1080,
+            captcha_extension_dir: None,
         }
     }
 }
@@ -170,6 +161,87 @@ impl BrowserSessionConfig {
         self.timeout_secs = timeout_secs;
         self
     }
+
+    /// Set 2Captcha extension directory
+    pub fn captcha_extension(mut self, dir: Option<String>) -> Self {
+        self.captcha_extension_dir = dir;
+        self
+    }
+
+    /// Find the 2Captcha solver extension directory.
+    /// Searches in order: next to executable, current working directory, src-tauri (dev).
+    pub fn find_captcha_extension() -> Option<String> {
+        let candidates = vec![
+            // Next to executable
+            std::env::current_exe().ok().and_then(|p| {
+                p.parent().map(|d| d.join("extensions").join("2captcha-solver"))
+            }),
+            // Current working directory
+            Some(std::path::PathBuf::from("extensions/2captcha-solver")),
+            // Dev mode (src-tauri relative)
+            Some(std::path::PathBuf::from("src-tauri/extensions/2captcha-solver")),
+        ];
+
+        for candidate in candidates.into_iter().flatten() {
+            let config_path = candidate.join("common").join("config.js");
+            if config_path.exists() {
+                if let Some(path_str) = candidate.to_str() {
+                    info!("Found 2Captcha extension at: {}", path_str);
+                    return Some(path_str.to_string());
+                }
+            }
+        }
+
+        warn!("2Captcha browser extension not found in any search path");
+        None
+    }
+
+    /// Configure the 2Captcha extension with the given API key.
+    /// Writes the API key into the extension's config.js defaults.
+    /// Only writes if the key actually changed (avoids triggering Tauri dev rebuild).
+    pub fn configure_captcha_extension(extension_dir: &str, api_key: &str) -> Result<(), String> {
+        let config_path = std::path::Path::new(extension_dir).join("common").join("config.js");
+
+        if !config_path.exists() {
+            return Err(format!("Extension config.js not found at: {}", config_path.display()));
+        }
+
+        let content = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config.js: {}", e))?;
+
+        let expected_line = format!("apiKey: \"{}\",", api_key);
+
+        // Check if the key is already set correctly — skip write to avoid triggering
+        // Tauri dev watcher rebuild loop
+        if content.contains(&expected_line) {
+            info!("2Captcha extension already configured with correct API key ({}...)", &api_key[..api_key.len().min(8)]);
+            return Ok(());
+        }
+
+        // Replace the apiKey value (either null, empty string, or existing key)
+        let updated = content
+            .replace(
+                &Self::find_api_key_line(&content).unwrap_or_else(|| "apiKey: \"\",".to_string()),
+                &expected_line,
+            );
+
+        std::fs::write(&config_path, &updated)
+            .map_err(|e| format!("Failed to write config.js: {}", e))?;
+
+        info!("2Captcha extension configured with API key ({}...)", &api_key[..api_key.len().min(8)]);
+        Ok(())
+    }
+
+    /// Find the apiKey line in config.js content
+    fn find_api_key_line(content: &str) -> Option<String> {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("apiKey:") {
+                return Some(trimmed.to_string());
+            }
+        }
+        None
+    }
 }
 
 /// A browser session for automation
@@ -178,8 +250,10 @@ pub struct BrowserSession {
     pub id: String,
     /// The browser instance
     browser: Arc<RwLock<Option<Browser>>>,
-    /// Current active page
-    page: Arc<RwLock<Option<Page>>>,
+    /// Current active page (ChaserPage wraps Page with stealth execution)
+    page: Arc<RwLock<Option<ChaserPage>>>,
+    /// Stealth profile (Saudi Arabia fingerprint)
+    profile: ChaserProfile,
     /// Session configuration
     config: BrowserSessionConfig,
     /// Whether session is alive
@@ -239,105 +313,81 @@ impl BrowserSession {
             builder = builder.user_data_dir(dir);
         }
 
-        // =========== UNDETECTED-CHROMEDRIVER STYLE FLAGS ===========
-        // Based on: https://github.com/ultrafunkamsterdam/undetected-chromedriver
+        // =========== STEALTH FLAGS (chaser-oxide Arg API) ===========
+        // IMPORTANT: Keys must NOT include "--" prefix — ArgsBuilder adds it automatically.
+        // Use "flag" for boolean flags, ("key", "value") for key=value pairs.
+        // Many flags (no-first-run, disable-sync, disable-dev-shm-usage, etc.)
+        // are already in chaser-oxide's DEFAULT_ARGS and don't need repeating.
+
         builder = builder
-            // REAL BROWSER PROFILE (not incognito) - more realistic
-            // Each session still gets unique user-data-dir via for_session()
+            // Anti-detection (undetected-chromedriver style)
+            .arg(("disable-blink-features", "AutomationControlled"))
+            .arg(("exclude-switches", "enable-automation"))
+            .arg("disable-automation")
+            .arg("disable-infobars")
+            .arg("no-default-browser-check")
 
-            // UNDETECTED-CHROMEDRIVER: Core flags that bypass detection
-            .arg("--disable-blink-features=AutomationControlled")
-            .arg("--exclude-switches=enable-automation")
-            .arg("--disable-automation")
-            .arg("--disable-infobars")
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--no-sandbox")
-            .arg("--disable-dev-shm-usage")
+            // Window position (size is set via builder.window_size())
+            .arg(("window-position", "50,50"))
 
-            // UNDETECTED-CHROMEDRIVER: Window size (reasonable size that fits most screens)
-            .arg("--window-size=1366,768")
-            .arg("--window-position=50,50")
-
-            // UNDETECTED-CHROMEDRIVER: Disable automation flags
-            .arg("--disable-blink-features=AutomationControlled")
-            .arg("--disable-features=AutomationControlled")
+            // Disable features (merged into ONE call — HashMap overwrites duplicate keys)
+            // DEFAULT_ARGS has TranslateUI, we must include it plus our extras
+            .arg(("disable-features", "TranslateUI,AutomationControlled,IsolateOrigins,site-per-process,AudioServiceOutOfProcess"))
 
             // Disable session restore (no "restore tabs" prompt)
-            .arg("--disable-session-crashed-bubble")
-            .arg("--disable-restore-session-state")
+            .arg("disable-session-crashed-bubble")
+            .arg("disable-restore-session-state")
 
-            // Start with blank page (prevents new tab page from loading)
-            .arg("--homepage=about:blank")
+            // Start with blank page
+            .arg(("homepage", "about:blank"))
 
-            // REAL BROWSER: Keep some extensions for realism, disable others
-            .arg("--disable-extensions-except=")
-            .arg("--load-extension=")
+            // Site isolation
+            .arg("disable-site-isolation-trials")
 
-            // Stealth settings
-            .arg("--disable-features=IsolateOrigins,site-per-process")
-            .arg("--disable-site-isolation-trials")
-            .arg("--disable-features=TranslateUI")
-            .arg("--disable-popup-blocking")
-            .arg("--disable-notifications")
-            .arg("--disable-save-password-bubble")
-            .arg("--disable-translate")
-            .arg("--disable-sync")
-            .arg("--disable-background-networking")
-            .arg("--disable-background-timer-throttling")
-            .arg("--disable-backgrounding-occluded-windows")
-            .arg("--disable-renderer-backgrounding")
-            .arg("--disable-client-side-phishing-detection")
-            .arg("--disable-default-apps")
-            .arg("--disable-hang-monitor")
-            .arg("--disable-prompt-on-repost")
-            .arg("--disable-domain-reliability")
-            .arg("--disable-component-update")
-            .arg("--disable-features=AudioServiceOutOfProcess")
+            // UI suppression
+            .arg("disable-notifications")
+            .arg("disable-save-password-bubble")
+            .arg("disable-translate")
 
-            // Performance
-            .arg("--disable-ipc-flooding-protection")
-            .arg("--enable-features=NetworkService,NetworkServiceInProcess");
+            // Other
+            .arg("disable-domain-reliability")
+            .arg("disable-component-update");
 
-        // ROTATING USER-AGENT: Pick random user-agent for each session
-        let user_agent = get_random_user_agent();
-        info!("Session {} using user-agent: {}", session_id, &user_agent[..50]);
-        builder = builder.arg(format!("--user-agent={}", user_agent))
+        // Load 2Captcha extension via chaser-oxide's builder method
+        // IMPORTANT: Must use .extension() not .arg(("load-extension", ...))
+        // because chaser-oxide adds --disable-extensions when its internal
+        // extensions vec is empty, which overrides any manual --load-extension args.
+        if let Some(ref ext_dir) = config.captcha_extension_dir {
+            info!("Session {} loading 2Captcha extension from: {}", session_id, ext_dir);
+            builder = builder.extension(ext_dir);
+        }
 
-            // Language settings for Saudi Arabia
-            .arg("--lang=ar-SA")
-            .arg("--accept-lang=ar-SA,ar,en-US,en")
+        // Auto-detect Chrome version for consistent fingerprint
+        let (chrome_major, chrome_full_ver) = detect_chrome_version()
+            .unwrap_or_else(|| {
+                warn!("Could not detect Chrome version, defaulting to 131");
+                (131, "131.0.6778.139".to_string())
+            });
 
-            // STEALTH: Disable WebRTC to prevent IP leak
-            .arg("--disable-webrtc")
-            .arg("--disable-webrtc-hw-encoding")
-            .arg("--disable-webrtc-hw-decoding")
-            .arg("--disable-webrtc-encryption")
-            .arg("--disable-webrtc-hw-vp8-encoding")
-            .arg("--disable-webrtc-multiple-routes")
-            .arg("--disable-webrtc-hw-vp9-encoding")
-            .arg("--enforce-webrtc-ip-permission-check")
-            .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+        // ChaserProfile handles: user-agent, lang, timezone, platform
+        // Chrome version must match the installed binary for consistency
+        let profile = create_saudi_profile(chrome_major);
+        info!("Session {} using profile: {} (full ver: {})", session_id, profile, chrome_full_ver);
 
-            // STEALTH: Timezone for Saudi Arabia (AST = UTC+3)
-            .arg("--timezone=Asia/Riyadh")
+        builder = builder
+            // WebRTC IP leak prevention
+            .arg("disable-webrtc")
+            .arg("disable-webrtc-hw-encoding")
+            .arg("disable-webrtc-hw-decoding")
+            .arg("disable-webrtc-encryption")
+            .arg("disable-webrtc-hw-vp8-encoding")
+            .arg("disable-webrtc-multiple-routes")
+            .arg("disable-webrtc-hw-vp9-encoding")
+            .arg("enforce-webrtc-ip-permission-check")
+            .arg(("force-webrtc-ip-handling-policy", "disable_non_proxied_udp"))
 
-            // STEALTH: Geolocation spoof (Riyadh)
-            .arg("--disable-geolocation")
-
-            // UNDETECTED-CHROMEDRIVER: DON'T disable canvas/WebGL (makes fingerprint unique but consistent)
-            // Real browsers have these enabled
-            // .arg("--disable-reading-from-canvas")  // REMOVED
-            // .arg("--disable-3d-apis")              // REMOVED
-            // .arg("--disable-accelerated-2d-canvas") // REMOVED
-
-            // STEALTH: More anti-detection flags
-            .arg("--disable-features=IsolateOrigins,site-per-process,TranslateUI")
-            .arg("--disable-blink-features=AutomationControlled")
-            .arg("--password-store=basic")
-            .arg("--use-mock-keychain")
-            // STEALTH: Fake screen resolution (common desktop)
-            .arg("--window-position=0,0");
+            // Geolocation: disable default, we override via CDP with Riyadh coordinates
+            .arg("disable-geolocation");
 
         // Set up local proxy forwarder if proxy is configured
         // This handles proxy authentication transparently for Chrome
@@ -362,14 +412,14 @@ impl BrowserSession {
                 // Use local proxy URL for Chrome (no auth needed!)
                 let local_proxy = forwarder.local_url();
                 info!("Session {} using local proxy: {}", session_id, local_proxy);
-                builder = builder.arg(format!("--proxy-server={}", local_proxy));
+                builder = builder.arg(("proxy-server", local_proxy.as_str()));
 
                 proxy_forwarder = Some(forwarder);
             } else {
                 // Fallback: use proxy URL directly (for proxies without auth)
                 let (chrome_proxy, _) = Self::parse_proxy_url(proxy_url);
                 info!("Session {} using direct proxy: {}", session_id, chrome_proxy);
-                builder = builder.arg(format!("--proxy-server={}", chrome_proxy));
+                builder = builder.arg(("proxy-server", chrome_proxy.as_str()));
             }
         }
 
@@ -417,24 +467,41 @@ impl BrowserSession {
             main_page
         };
 
-        // Inject anti-detection JavaScript
-        Self::inject_anti_detection(&page).await?;
+        // Wrap page in ChaserPage for protocol-level stealth
+        let chaser = ChaserPage::new(page);
 
-        // Inject session-specific evasions (userAgentData, platform) matching the actual User-Agent
-        Self::inject_session_specific_evasions(&page, user_agent).await?;
+        // === ZERO JavaScript overrides approach ===
+        // ChaserProfile's apply_profile() injects a bootstrap_script that modifies
+        // JavaScript prototypes (navigator.platform, webdriver, userAgentData, etc.)
+        // These JS-level modifications are DETECTABLE by Google's bot detection.
+        // Instead, we use ONLY CDP-level overrides which work at the browser engine
+        // level and are invisible to JavaScript inspection.
+        //
+        // DISABLED: chaser.apply_profile(&profile) — no JS bootstrap
+        // DISABLED: inject_extra_evasions() — no JS prototype modifications
+        //
+        // navigator.webdriver is handled by Chrome flag: --disable-blink-features=AutomationControlled
+        // This sets it to false at the C++ level, not JavaScript level.
 
-        // Set consistent HTTP headers via CDP (Sec-CH-UA, Accept-Language for Saudi Arabia)
-        Self::set_cdp_headers(&page, user_agent).await?;
+        // 1) CDP User-Agent + Metadata (sets UA string, Sec-CH-UA headers, Accept-Language)
+        Self::set_cdp_headers(chaser.raw_page(), &profile, &chrome_full_ver).await?;
+
+        // 2) CDP Timezone Override (sets Date.getTimezoneOffset and Intl.DateTimeFormat natively)
+        Self::set_timezone_override(chaser.raw_page()).await?;
+
+        // Override geolocation to Riyadh (24.7136°N, 46.6753°E) via CDP
+        Self::set_geolocation_riyadh(chaser.raw_page()).await?;
 
         // Block unnecessary resources to reduce proxy bandwidth consumption
-        Self::block_unnecessary_resources(&page).await?;
+        Self::block_unnecessary_resources(chaser.raw_page()).await?;
 
-        info!("Browser session {} created successfully", session_id);
+        info!("Browser session {} created (CDP-only, zero JS overrides, Chrome {})", session_id, chrome_full_ver);
 
         Ok(Self {
             id: session_id,
             browser: Arc::new(RwLock::new(Some(browser))),
-            page: Arc::new(RwLock::new(Some(page))),
+            page: Arc::new(RwLock::new(Some(chaser))),
+            profile,
             config,
             alive: Arc::new(AtomicBool::new(true)),
             current_ip: Arc::new(RwLock::new(None)),
@@ -533,11 +600,11 @@ impl BrowserSession {
 
     /// Navigate to a URL
     pub async fn navigate(&self, url: &str) -> Result<(), BrowserError> {
-        let page = self.page.read().await;
-        let page = page.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
 
         debug!("Session {} navigating to: {}", self.id, url);
-        page.goto(url)
+        chaser.goto(url)
             .await
             .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
 
@@ -546,12 +613,12 @@ impl BrowserSession {
 
     /// Wait for navigation to complete
     pub async fn wait_for_navigation(&self, timeout_secs: u64) -> Result<(), BrowserError> {
-        let page = self.page.read().await;
-        let page = page.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
 
         tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            page.wait_for_navigation()
+            chaser.raw_page().wait_for_navigation()
         )
         .await
         .map_err(|_| BrowserError::Timeout("Navigation timeout".into()))?
@@ -561,32 +628,35 @@ impl BrowserSession {
     }
 
     /// Execute JavaScript on the page with default 60 second timeout
+    /// Uses stealth evaluation (isolated world) to avoid detection
     pub async fn execute_js(&self, script: &str) -> Result<serde_json::Value, BrowserError> {
         self.execute_js_with_timeout(script, 60).await
     }
 
     /// Execute JavaScript on the page with custom timeout (in seconds)
+    /// Uses stealth evaluation via ChaserPage (isolated world, no Runtime.enable)
     pub async fn execute_js_with_timeout(&self, script: &str, timeout_secs: u64) -> Result<serde_json::Value, BrowserError> {
-        let page = self.page.read().await;
-        let page = page.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
 
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            page.evaluate(script)
+            chaser.evaluate_stealth(script)
         )
         .await
         .map_err(|_| BrowserError::Timeout(format!("JavaScript execution timed out after {}s", timeout_secs)))?
         .map_err(|e| BrowserError::JavaScriptError(e.to_string()))?;
 
-        Ok(result.value().cloned().unwrap_or(serde_json::Value::Null))
+        // evaluate_stealth returns Option<Value>
+        Ok(result.unwrap_or(serde_json::Value::Null))
     }
 
     /// Get current URL
     pub async fn get_current_url(&self) -> Result<String, BrowserError> {
-        let page = self.page.read().await;
-        let page = page.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
 
-        page.url()
+        chaser.url()
             .await
             .map_err(|e| BrowserError::ConnectionLost(e.to_string()))?
             .ok_or_else(|| BrowserError::ConnectionLost("No URL".into()))
@@ -594,10 +664,10 @@ impl BrowserSession {
 
     /// Click on an element by selector
     pub async fn click(&self, selector: &str) -> Result<(), BrowserError> {
-        let page = self.page.read().await;
-        let page = page.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
 
-        let element = page.find_element(selector)
+        let element = chaser.raw_page().find_element(selector)
             .await
             .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
 
@@ -609,19 +679,355 @@ impl BrowserSession {
         Ok(())
     }
 
-    /// Type text into an element
+    /// Type text into an element using human-like typing via ChaserPage
     pub async fn type_text(&self, selector: &str, text: &str) -> Result<(), BrowserError> {
-        let page = self.page.read().await;
-        let page = page.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
 
-        let element = page.find_element(selector)
+        // Click the element first
+        let element = chaser.raw_page().find_element(selector)
             .await
             .map_err(|e| BrowserError::ElementNotFound(format!("{}: {}", selector, e)))?;
-
         element.click().await.ok();
-        element.type_str(text)
+
+        // Type with human-like delays using ChaserPage
+        chaser.type_text(text)
             .await
             .map_err(|e| BrowserError::JavaScriptError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Type text into currently focused element using raw CDP keyboard events (Send-safe)
+    /// Uses Input.dispatchKeyEvent directly, bypassing chaser-oxide's !Send methods
+    pub async fn type_text_cdp(&self, text: &str) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
+        use rand::SeedableRng;
+
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let page = chaser.raw_page();
+
+        let mut rng = rand::rngs::StdRng::from_entropy();
+
+        for c in text.chars() {
+            // Send keyDown with the character text
+            let key_down = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyDown)
+                .text(c.to_string())
+                .build()
+                .unwrap();
+            page.execute(key_down)
+                .await
+                .map_err(|e| BrowserError::JavaScriptError(format!("CDP keyDown failed: {}", e)))?;
+
+            // Send keyUp
+            let key_up = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyUp)
+                .build()
+                .unwrap();
+            page.execute(key_up)
+                .await
+                .map_err(|e| BrowserError::JavaScriptError(format!("CDP keyUp failed: {}", e)))?;
+
+            // Human-like delay between keystrokes (50-150ms)
+            let delay = rng.gen_range(50..150);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
+        Ok(())
+    }
+
+    /// Press Enter key via raw CDP (Send-safe)
+    pub async fn press_enter(&self) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
+        use rand::SeedableRng;
+
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let page = chaser.raw_page();
+
+        // Small random delay before pressing (100-300ms)
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let delay = rng.gen_range(100..300);
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+
+        // rawKeyDown Enter (with full key properties for proper form submission)
+        let key_down = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::RawKeyDown)
+            .key("Enter")
+            .code("Enter")
+            .windows_virtual_key_code(13)
+            .native_virtual_key_code(13)
+            .build()
+            .unwrap();
+        page.execute(key_down)
+            .await
+            .map_err(|e| BrowserError::JavaScriptError(format!("CDP Enter keyDown failed: {}", e)))?;
+
+        // char event with \r (triggers form submission in most browsers)
+        let char_event = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::Char)
+            .text("\r")
+            .build()
+            .unwrap();
+        page.execute(char_event)
+            .await
+            .map_err(|e| BrowserError::JavaScriptError(format!("CDP Enter char failed: {}", e)))?;
+
+        // keyUp Enter
+        let key_up = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::KeyUp)
+            .key("Enter")
+            .code("Enter")
+            .windows_virtual_key_code(13)
+            .native_virtual_key_code(13)
+            .build()
+            .unwrap();
+        page.execute(key_up)
+            .await
+            .map_err(|e| BrowserError::JavaScriptError(format!("CDP Enter keyUp failed: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Scroll the page using CDP mouse wheel events (Send-safe)
+    pub async fn scroll_human(&self, delta_y: i32) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::input::{
+            DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+        };
+        use rand::SeedableRng;
+
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let page = chaser.raw_page();
+
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let steps = 3 + rng.gen_range(0..3);
+        let per_step = delta_y / steps;
+
+        for _ in 0..steps {
+            let jitter = rng.gen_range(-20..20);
+            let scroll = DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseWheel)
+                .x(400.0)
+                .y(300.0)
+                .button(MouseButton::None)
+                .delta_x(0.0)
+                .delta_y((per_step + jitter) as f64)
+                .build()
+                .unwrap();
+            page.execute(scroll)
+                .await
+                .map_err(|e| BrowserError::JavaScriptError(format!("CDP scroll failed: {}", e)))?;
+
+            let delay = rng.gen_range(80..200);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
+        Ok(())
+    }
+
+    /// Move mouse with physics-based bezier curve (Send-safe)
+    /// Simulates natural mouse movement with overshoot and easing
+    pub async fn move_mouse_human(&self, target_x: f64, target_y: f64) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::input::{
+            DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+        };
+        use rand::SeedableRng;
+
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let page = chaser.raw_page();
+
+        let mut rng = rand::rngs::StdRng::from_entropy();
+
+        // Start from a random position (simulates existing cursor)
+        let start_x: f64 = rng.gen_range(100.0..800.0);
+        let start_y: f64 = rng.gen_range(100.0..500.0);
+
+        // Generate bezier control points with slight overshoot
+        let overshoot = rng.gen_range(0.0..15.0);
+        let cp1_x = start_x + (target_x - start_x) * 0.25 + rng.gen_range(-50.0..50.0);
+        let cp1_y = start_y + (target_y - start_y) * 0.25 + rng.gen_range(-40.0..40.0);
+        let cp2_x = target_x + overshoot * rng.gen_range(-1.0..1.0);
+        let cp2_y = target_y + overshoot * rng.gen_range(-1.0..1.0);
+
+        // Number of steps based on distance (more steps = smoother)
+        let distance = ((target_x - start_x).powi(2) + (target_y - start_y).powi(2)).sqrt();
+        let steps = (15.0 + distance / 30.0).min(40.0) as i32;
+
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let mt = 1.0 - t;
+
+            // Cubic bezier
+            let x = mt.powi(3) * start_x
+                + 3.0 * mt.powi(2) * t * cp1_x
+                + 3.0 * mt * t.powi(2) * cp2_x
+                + t.powi(3) * target_x;
+            let y = mt.powi(3) * start_y
+                + 3.0 * mt.powi(2) * t * cp1_y
+                + 3.0 * mt * t.powi(2) * cp2_y
+                + t.powi(3) * target_y;
+
+            let move_event = DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseMoved)
+                .x(x)
+                .y(y)
+                .button(MouseButton::None)
+                .build()
+                .unwrap();
+            page.execute(move_event).await.ok();
+
+            // Variable delay: faster in middle, slower at start/end (ease in/out)
+            let speed_factor = 1.0 - (2.0 * t - 1.0).abs(); // peak at t=0.5
+            let delay = (8.0 + 12.0 * (1.0 - speed_factor) + rng.gen_range(0.0..5.0)) as u64;
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
+        Ok(())
+    }
+
+    /// Click at coordinates with human-like mouse movement first (Send-safe)
+    pub async fn click_human_at(&self, x: f64, y: f64) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::input::{
+            DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+        };
+        use rand::SeedableRng;
+
+        // Move mouse to target first
+        self.move_mouse_human(x, y).await?;
+
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let page = chaser.raw_page();
+
+        let mut rng = rand::rngs::StdRng::from_entropy();
+
+        // Small jitter on click position (humans don't click pixel-perfect)
+        let click_x = x + rng.gen_range(-2.0..2.0);
+        let click_y = y + rng.gen_range(-2.0..2.0);
+
+        // Brief pause before clicking (50-150ms)
+        let pre_click = rng.gen_range(50..150);
+        tokio::time::sleep(Duration::from_millis(pre_click)).await;
+
+        // Mouse down
+        let mouse_down = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MousePressed)
+            .x(click_x)
+            .y(click_y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+            .unwrap();
+        page.execute(mouse_down).await
+            .map_err(|e| BrowserError::JavaScriptError(format!("CDP mouseDown failed: {}", e)))?;
+
+        // Hold duration (40-120ms like real clicks)
+        let hold = rng.gen_range(40..120);
+        tokio::time::sleep(Duration::from_millis(hold)).await;
+
+        // Mouse up
+        let mouse_up = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MouseReleased)
+            .x(click_x)
+            .y(click_y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+            .unwrap();
+        page.execute(mouse_up).await
+            .map_err(|e| BrowserError::JavaScriptError(format!("CDP mouseUp failed: {}", e)))?;
+
+        self.increment_clicks();
+        Ok(())
+    }
+
+    /// Type text with occasional typos and corrections (Send-safe)
+    /// Simulates realistic typing with variable speed, pauses, and typo corrections
+    pub async fn type_text_with_typos_cdp(&self, text: &str) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
+        use rand::SeedableRng;
+
+        let chaser = self.page.read().await;
+        let chaser = chaser.as_ref().ok_or(BrowserError::ConnectionLost("No active page".into()))?;
+        let page = chaser.raw_page();
+
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let chars: Vec<char> = text.chars().collect();
+
+        for (i, &c) in chars.iter().enumerate() {
+            // 3% chance of typo (type wrong char, pause, backspace, retype)
+            if rng.gen_bool(0.03) && i > 0 {
+                // Type a wrong character (nearby key or random)
+                let typo_char = if c.is_ascii_alphabetic() {
+                    // Pick a random nearby letter
+                    let offset: i32 = if rng.gen_bool(0.5) { 1 } else { -1 };
+                    let typo = ((c as i32) + offset) as u8 as char;
+                    if typo.is_ascii_alphabetic() { typo } else { c }
+                } else {
+                    c // Don't typo non-alpha chars
+                };
+
+                if typo_char != c {
+                    // Type wrong char
+                    let wrong = DispatchKeyEventParams::builder()
+                        .r#type(DispatchKeyEventType::KeyDown)
+                        .text(typo_char.to_string())
+                        .build().unwrap();
+                    page.execute(wrong).await.ok();
+                    let up = DispatchKeyEventParams::builder()
+                        .r#type(DispatchKeyEventType::KeyUp)
+                        .build().unwrap();
+                    page.execute(up).await.ok();
+
+                    // Pause (noticing the mistake: 200-500ms)
+                    tokio::time::sleep(Duration::from_millis(rng.gen_range(200..500))).await;
+
+                    // Backspace
+                    let bs_down = DispatchKeyEventParams::builder()
+                        .r#type(DispatchKeyEventType::RawKeyDown)
+                        .key("Backspace").code("Backspace")
+                        .windows_virtual_key_code(8)
+                        .build().unwrap();
+                    page.execute(bs_down).await.ok();
+                    let bs_up = DispatchKeyEventParams::builder()
+                        .r#type(DispatchKeyEventType::KeyUp)
+                        .key("Backspace").code("Backspace")
+                        .build().unwrap();
+                    page.execute(bs_up).await.ok();
+
+                    // Brief pause after correction (100-250ms)
+                    tokio::time::sleep(Duration::from_millis(rng.gen_range(100..250))).await;
+                }
+            }
+
+            // Type the correct character
+            let key_down = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyDown)
+                .text(c.to_string())
+                .build().unwrap();
+            page.execute(key_down).await
+                .map_err(|e| BrowserError::JavaScriptError(format!("CDP keyDown failed: {}", e)))?;
+
+            let key_up = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyUp)
+                .build().unwrap();
+            page.execute(key_up).await
+                .map_err(|e| BrowserError::JavaScriptError(format!("CDP keyUp failed: {}", e)))?;
+
+            // Variable delay between keystrokes
+            let base_delay = rng.gen_range(60..180); // slower than before (was 50-150)
+            // 8% chance of a longer "thinking" pause between words
+            let delay = if c == ' ' || rng.gen_bool(0.08) {
+                rng.gen_range(200..500)
+            } else {
+                base_delay
+            };
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
 
         Ok(())
     }
@@ -651,11 +1057,11 @@ impl BrowserSession {
     pub async fn close(&self) -> Result<(), BrowserError> {
         self.alive.store(false, Ordering::Relaxed);
 
-        // Close page
+        // Close page (ChaserPage wraps Page - clone to get owned Page for close)
         {
-            let mut page = self.page.write().await;
-            if let Some(p) = page.take() {
-                let _ = p.close().await;
+            let mut chaser = self.page.write().await;
+            if let Some(c) = chaser.take() {
+                let _ = c.raw_page().clone().close().await;
             }
         }
 
@@ -762,793 +1168,221 @@ impl BrowserSession {
         }
     }
 
-    /// Inject comprehensive anti-detection JavaScript (puppeteer-stealth equivalent)
-    async fn inject_anti_detection(page: &Page) -> Result<(), BrowserError> {
-        // Comprehensive stealth script based on puppeteer-extra-plugin-stealth
-        page.evaluate(r#"
-            // =========== STEALTH EVASIONS ===========
-
-            // 1. Remove webdriver property
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined,
-                configurable: true
-            });
-            delete Object.getPrototypeOf(navigator).webdriver;
-
-            // 2. Mock plugins array (realistic Chrome plugins)
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => {
-                    const plugins = [
-                        {
-                            name: 'Chrome PDF Plugin',
-                            filename: 'internal-pdf-viewer',
-                            description: 'Portable Document Format',
-                            length: 1,
-                            0: { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' }
-                        },
-                        {
-                            name: 'Chrome PDF Viewer',
-                            filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
-                            description: '',
-                            length: 1,
-                            0: { type: 'application/pdf', suffixes: 'pdf', description: '' }
-                        },
-                        {
-                            name: 'Native Client',
-                            filename: 'internal-nacl-plugin',
-                            description: '',
-                            length: 2,
-                            0: { type: 'application/x-nacl', suffixes: '', description: 'Native Client Executable' },
-                            1: { type: 'application/x-pnacl', suffixes: '', description: 'Portable Native Client Executable' }
-                        }
-                    ];
-                    plugins.item = (i) => plugins[i] || null;
-                    plugins.namedItem = (name) => plugins.find(p => p.name === name) || null;
-                    plugins.refresh = () => {};
-                    Object.setPrototypeOf(plugins, PluginArray.prototype);
-                    return plugins;
-                }
-            });
-
-            // 3. Mock mimeTypes
-            Object.defineProperty(navigator, 'mimeTypes', {
-                get: () => {
-                    const mimes = [
-                        { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: navigator.plugins[0] },
-                        { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: navigator.plugins[0] },
-                        { type: 'application/x-nacl', suffixes: '', description: 'Native Client Executable', enabledPlugin: navigator.plugins[2] },
-                        { type: 'application/x-pnacl', suffixes: '', description: 'Portable Native Client Executable', enabledPlugin: navigator.plugins[2] }
-                    ];
-                    mimes.item = (i) => mimes[i] || null;
-                    mimes.namedItem = (name) => mimes.find(m => m.type === name) || null;
-                    Object.setPrototypeOf(mimes, MimeTypeArray.prototype);
-                    return mimes;
-                }
-            });
-
-            // 4. Mock languages (Arabic + English for Saudi region)
-            Object.defineProperty(navigator, 'languages', { get: () => Object.freeze(['ar-SA', 'ar', 'en-US', 'en']) });
-            Object.defineProperty(navigator, 'language', { get: () => 'ar-SA' });
-
-            // 5. Mock platform and userAgent properties (configurable for session-specific override)
-            Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true });
-            Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
-            Object.defineProperty(navigator, 'productSub', { get: () => '20030107' });
-
-            // 6. Mock hardware properties
-            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-            Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
-
-            // 7. Mock permissions API
-            const originalQuery = navigator.permissions?.query?.bind(navigator.permissions);
-            if (originalQuery) {
-                navigator.permissions.query = (params) => {
-                    if (params.name === 'notifications') {
-                        return Promise.resolve({ state: Notification.permission, onchange: null });
-                    }
-                    return originalQuery(params);
-                };
-            }
-
-            // 8. Mock chrome runtime object
-            window.chrome = window.chrome || {};
-            window.chrome.runtime = {
-                connect: () => {},
-                sendMessage: () => {},
-                onConnect: { addListener: () => {} },
-                onMessage: { addListener: () => {} }
-            };
-            window.chrome.loadTimes = () => ({
-                requestTime: Date.now() / 1000 - 5,
-                startLoadTime: Date.now() / 1000 - 4,
-                commitLoadTime: Date.now() / 1000 - 3,
-                finishDocumentLoadTime: Date.now() / 1000 - 2,
-                finishLoadTime: Date.now() / 1000 - 1,
-                firstPaintTime: Date.now() / 1000 - 0.5,
-                firstPaintAfterLoadTime: 0,
-                navigationType: 'Other',
-                wasFetchedViaSpdy: false,
-                wasNpnNegotiated: true,
-                npnNegotiatedProtocol: 'h2',
-                wasAlternateProtocolAvailable: false,
-                connectionInfo: 'h2'
-            });
-            window.chrome.csi = () => ({
-                startE: Date.now() - 5000,
-                onloadT: Date.now() - 1000,
-                pageT: Date.now(),
-                tran: 15
-            });
-            window.chrome.app = { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } };
-
-            // 9. WebGL fingerprint evasion
-            const getParameterProxy = new Proxy(WebGLRenderingContext.prototype.getParameter, {
-                apply: function(target, thisArg, args) {
-                    if (args[0] === 37445) return 'Intel Inc.'; // UNMASKED_VENDOR_WEBGL
-                    if (args[0] === 37446) return 'Intel(R) Iris(R) Xe Graphics'; // UNMASKED_RENDERER_WEBGL
-                    return Reflect.apply(target, thisArg, args);
-                }
-            });
-            WebGLRenderingContext.prototype.getParameter = getParameterProxy;
-
-            try {
-                const getParameter2Proxy = new Proxy(WebGL2RenderingContext.prototype.getParameter, {
-                    apply: function(target, thisArg, args) {
-                        if (args[0] === 37445) return 'Intel Inc.';
-                        if (args[0] === 37446) return 'Intel(R) Iris(R) Xe Graphics';
-                        return Reflect.apply(target, thisArg, args);
-                    }
-                });
-                WebGL2RenderingContext.prototype.getParameter = getParameter2Proxy;
-            } catch(e) {}
-
-            // 10. Visibility state (always visible)
-            Object.defineProperty(document, 'hidden', { get: () => false });
-            Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
-
-            // 11. Fix toString() for native functions
-            const nativeToStringFunctionString = Error.toString().replace(/Error/g, 'toString');
-            const oldCall = Function.prototype.call;
-            function call() { return oldCall.apply(this, arguments); }
-            Function.prototype.call = call;
-            const nativeToStringFunction = Function.prototype.toString;
-            const proxiedToString = new Proxy(nativeToStringFunction, {
-                apply: function(target, thisArg, args) {
-                    if (thisArg === navigator.permissions.query) return 'function query() { [native code] }';
-                    if (thisArg === document.hasFocus) return 'function hasFocus() { [native code] }';
-                    return Reflect.apply(target, thisArg, args);
-                }
-            });
-            Function.prototype.toString = proxiedToString;
-
-            // 12. Mock connection API
-            Object.defineProperty(navigator, 'connection', {
-                get: () => ({
-                    effectiveType: '4g',
-                    rtt: 50 + Math.floor(Math.random() * 50),
-                    downlink: 10 + Math.random() * 5,
-                    saveData: false,
-                    onchange: null,
-                    addEventListener: () => {},
-                    removeEventListener: () => {}
-                })
-            });
-
-            // 13. Mock battery API
-            navigator.getBattery = () => Promise.resolve({
-                charging: true,
-                chargingTime: 0,
-                dischargingTime: Infinity,
-                level: 0.95 + Math.random() * 0.05,
-                addEventListener: () => {},
-                removeEventListener: () => {},
-                onchargingchange: null,
-                onchargingtimechange: null,
-                ondischargingtimechange: null,
-                onlevelchange: null
-            });
-
-            // 14. Canvas fingerprint protection (add subtle noise)
-            const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-            CanvasRenderingContext2D.prototype.getImageData = function(...args) {
-                const imageData = originalGetImageData.apply(this, args);
-                // Add very subtle noise to prevent exact fingerprinting
-                for (let i = 0; i < imageData.data.length; i += 4) {
-                    if (Math.random() < 0.01) {
-                        imageData.data[i] = Math.max(0, Math.min(255, imageData.data[i] + (Math.random() > 0.5 ? 1 : -1)));
-                    }
-                }
-                return imageData;
-            };
-
-            // 15. Prevent automation detection via CDP
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-
-            // 16. Mock getClientRects (prevent empty iframe detection)
-            const originalGetClientRects = Element.prototype.getClientRects;
-            Element.prototype.getClientRects = function() {
-                const rects = originalGetClientRects.apply(this, arguments);
-                if (rects.length === 0 && this.tagName === 'IFRAME') {
-                    return [{ top: 0, right: 0, bottom: 0, left: 0, width: 0, height: 0 }];
-                }
-                return rects;
-            };
-
-            // 17. Prevent WebDriver detection via error stack traces
-            const originalError = Error;
-            Error = function(...args) {
-                const err = new originalError(...args);
-                const stack = err.stack;
-                if (stack && stack.includes('webdriver')) {
-                    err.stack = stack.replace(/webdriver/gi, 'driver');
-                }
-                return err;
-            };
-            Error.prototype = originalError.prototype;
-
-            // 18. Mock performance.memory (Chromium only)
-            if (window.performance && !window.performance.memory) {
-                Object.defineProperty(window.performance, 'memory', {
-                    get: () => ({
-                        jsHeapSizeLimit: 4294705152,
-                        totalJSHeapSize: 35839098,
-                        usedJSHeapSize: 28678374
-                    })
-                });
-            }
-
-            // 19. WebRTC IP leak protection
-            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-                navigator.mediaDevices.getUserMedia = () => Promise.reject(new Error('Permission denied'));
-            }
-            if (window.RTCPeerConnection) {
-                window.RTCPeerConnection = class extends window.RTCPeerConnection {
-                    constructor(config) {
-                        if (config && config.iceServers) {
-                            config.iceServers = [];
-                        }
-                        super(config);
-                    }
-                };
-            }
-            if (window.RTCDataChannel) {
-                const origCreateDataChannel = RTCPeerConnection.prototype.createDataChannel;
-                RTCPeerConnection.prototype.createDataChannel = function() {
-                    return origCreateDataChannel.apply(this, arguments);
-                };
-            }
-
-            // 20. Timezone spoof (Saudi Arabia - UTC+3)
-            const targetTimezone = 'Asia/Riyadh';
-            const targetOffset = -180; // UTC+3 in minutes (negative because getTimezoneOffset returns opposite)
-
-            const OriginalDate = Date;
-            Date = class extends OriginalDate {
-                constructor(...args) {
-                    super(...args);
-                }
-                getTimezoneOffset() {
-                    return targetOffset;
-                }
-            };
-            Date.now = OriginalDate.now;
-            Date.parse = OriginalDate.parse;
-            Date.UTC = OriginalDate.UTC;
-
-            // Also spoof Intl.DateTimeFormat
-            const origDateTimeFormat = Intl.DateTimeFormat;
-            Intl.DateTimeFormat = function(locales, options) {
-                options = options || {};
-                options.timeZone = options.timeZone || targetTimezone;
-                return new origDateTimeFormat(locales, options);
-            };
-            Intl.DateTimeFormat.prototype = origDateTimeFormat.prototype;
-            Intl.DateTimeFormat.supportedLocalesOf = origDateTimeFormat.supportedLocalesOf;
-
-            // 21. Screen resolution (common desktop)
-            Object.defineProperty(screen, 'width', { get: () => 1920 });
-            Object.defineProperty(screen, 'height', { get: () => 1080 });
-            Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
-            Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
-            Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
-            Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
-
-            // 22. Prevent font fingerprinting
-            const originalOffsetWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetWidth');
-            const originalOffsetHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
-
-            // 23. Navigator properties for Saudi Arabia
-            Object.defineProperty(navigator, 'doNotTrack', { get: () => '1' });
-
-            // 24. Disable Notification API fingerprinting
-            if (window.Notification) {
-                window.Notification.requestPermission = () => Promise.resolve('denied');
-            }
-
-            // 25. AudioContext fingerprint protection
-            if (window.AudioContext || window.webkitAudioContext) {
-                const AudioCtx = window.AudioContext || window.webkitAudioContext;
-                const origCreateAnalyser = AudioCtx.prototype.createAnalyser;
-                AudioCtx.prototype.createAnalyser = function() {
-                    const analyser = origCreateAnalyser.call(this);
-                    const origGetFloatFrequencyData = analyser.getFloatFrequencyData;
-                    analyser.getFloatFrequencyData = function(array) {
-                        origGetFloatFrequencyData.call(this, array);
-                        // Add slight noise
-                        for (let i = 0; i < array.length; i++) {
-                            array[i] += (Math.random() - 0.5) * 0.1;
-                        }
-                    };
-                    return analyser;
-                };
-            }
-
-            // 26. Speech synthesis fingerprint protection
-            if (window.speechSynthesis) {
-                const origGetVoices = window.speechSynthesis.getVoices;
-                window.speechSynthesis.getVoices = function() {
-                    return []; // Return empty to prevent fingerprinting
-                };
-            }
-
-            // 27. Media codecs evasion (puppeteer-stealth)
-            const originalCanPlayType = HTMLMediaElement.prototype.canPlayType;
-            HTMLMediaElement.prototype.canPlayType = function(type) {
-                // Return realistic responses for common codecs
-                if (type.includes('video/mp4')) return 'probably';
-                if (type.includes('video/webm')) return 'probably';
-                if (type.includes('video/ogg')) return 'maybe';
-                if (type.includes('audio/mpeg')) return 'probably';
-                if (type.includes('audio/mp4')) return 'probably';
-                if (type.includes('audio/ogg')) return 'probably';
-                if (type.includes('audio/wav')) return 'probably';
-                if (type.includes('audio/webm')) return 'probably';
-                return originalCanPlayType.call(this, type);
-            };
-
-            // 28. iframe.contentWindow evasion (puppeteer-stealth)
-            try {
-                const originalContentWindow = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
-                if (originalContentWindow && originalContentWindow.get) {
-                    Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
-                        get: function() {
-                            const win = originalContentWindow.get.call(this);
-                            if (win) {
-                                try {
-                                    // Ensure chrome object is consistent across iframes
-                                    if (!win.chrome && window.chrome) {
-                                        Object.defineProperty(win, 'chrome', {
-                                            get: () => window.chrome,
-                                            configurable: true
-                                        });
-                                    }
-                                } catch (e) {
-                                    // Cross-origin iframe, ignore
-                                }
-                            }
-                            return win;
-                        }
-                    });
-                }
-            } catch (e) {
-                // Fallback if property descriptor fails
-            }
-
-            // 29. Source URL evasion (hide automation traces in stack traces)
-            try {
-                const originalPrepareStackTrace = Error.prepareStackTrace;
-                Error.prepareStackTrace = function(error, stack) {
-                    let result;
-                    if (originalPrepareStackTrace) {
-                        result = originalPrepareStackTrace(error, stack);
-                    } else {
-                        result = stack.map(frame => frame.toString()).join('\n');
-                    }
-                    // Hide automation-related strings in stack traces
-                    if (typeof result === 'string') {
-                        result = result.replace(/puppeteer|chromium|headless|webdriver|selenium/gi, 'chrome');
-                    }
-                    return result;
-                };
-            } catch (e) {
-                // Fallback for environments where prepareStackTrace isn't writable
-            }
-
-            // 30. Additional detection bypass for CDP (Chrome DevTools Protocol)
-            try {
-                // Hide Runtime.enable detection
-                delete window.__proto__.Runtime;
-                // Hide debugger detection
-                const originalSetTimeout = window.setTimeout;
-                window.setTimeout = function(fn, delay, ...args) {
-                    if (typeof fn === 'string' && fn.includes('debugger')) {
-                        return null;
-                    }
-                    return originalSetTimeout.call(this, fn, delay, ...args);
-                };
-            } catch (e) {}
-
-            // =========== UNDETECTED-CHROMEDRIVER PATCHES ===========
-
-            // Remove all cdc_ variables (Chrome DevTools Protocol markers)
-            // These are injected by chromedriver and detected by anti-bot systems
-            const cdcProps = Object.getOwnPropertyNames(window).filter(p => p.startsWith('cdc_') || p.startsWith('$cdc_'));
-            for (const prop of cdcProps) {
-                try { delete window[prop]; } catch(e) {}
-            }
-
-            // Remove $chrome_asyncScriptInfo (another chromedriver marker)
-            try { delete window.$chrome_asyncScriptInfo; } catch(e) {}
-
-            // Remove webdriver from navigator prototype chain
-            try {
-                const proto = Object.getPrototypeOf(navigator);
-                if (proto.hasOwnProperty('webdriver')) {
-                    delete proto.webdriver;
-                }
-            } catch(e) {}
-
-            // Patch navigator.webdriver at multiple levels
-            Object.defineProperty(Navigator.prototype, 'webdriver', {
-                get: () => undefined,
-                configurable: true
-            });
-
-            // Remove automation-related properties from window
-            const autoProps = ['domAutomation', 'domAutomationController', '_phantom', '_selenium', 'callPhantom', 'callSelenium', '__nightmare', 'emit', 'spawn'];
-            for (const prop of autoProps) {
-                try { delete window[prop]; } catch(e) {}
-            }
-
-            // Patch document.$cdc_asdjflasutopfhvcZLmcfl_ (common chromedriver marker)
-            const docCdcProps = Object.getOwnPropertyNames(document).filter(p => p.includes('cdc') || p.includes('driver'));
-            for (const prop of docCdcProps) {
-                try { delete document[prop]; } catch(e) {}
-            }
-
-            // =========== ADVANCED STEALTH (2025 techniques) ===========
-
-            // 31. User-Agent Client Hints API (modern detection method)
-            if (navigator.userAgentData) {
-                Object.defineProperty(navigator, 'userAgentData', {
-                    configurable: true,
-                    get: () => ({
-                        brands: [
-                            { brand: 'Google Chrome', version: '131' },
-                            { brand: 'Chromium', version: '131' },
-                            { brand: 'Not_A Brand', version: '24' }
-                        ],
-                        mobile: false,
-                        platform: 'Windows',
-                        getHighEntropyValues: (hints) => Promise.resolve({
-                            architecture: 'x86',
-                            bitness: '64',
-                            brands: [
-                                { brand: 'Google Chrome', version: '131' },
-                                { brand: 'Chromium', version: '131' },
-                                { brand: 'Not_A Brand', version: '24' }
-                            ],
-                            fullVersionList: [
-                                { brand: 'Google Chrome', version: '131.0.6778.85' },
-                                { brand: 'Chromium', version: '131.0.6778.85' },
-                                { brand: 'Not_A Brand', version: '24.0.0.0' }
-                            ],
-                            mobile: false,
-                            model: '',
-                            platform: 'Windows',
-                            platformVersion: '15.0.0',
-                            uaFullVersion: '131.0.6778.85'
-                        }),
-                        toJSON: () => ({
-                            brands: [
-                                { brand: 'Google Chrome', version: '131' },
-                                { brand: 'Chromium', version: '131' },
-                                { brand: 'Not_A Brand', version: '24' }
-                            ],
-                            mobile: false,
-                            platform: 'Windows'
-                        })
-                    })
-                });
-            }
-
-            // 32. Window dimensions consistency (headless detection)
-            Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth + 16 });
-            Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 88 });
-            Object.defineProperty(window, 'screenX', { get: () => 0 });
-            Object.defineProperty(window, 'screenY', { get: () => 0 });
-            Object.defineProperty(window, 'screenLeft', { get: () => 0 });
-            Object.defineProperty(window, 'screenTop', { get: () => 0 });
-
-            // 33. DevTools detection bypass (console timing attack)
-            const originalConsoleLog = console.log;
-            console.log = function(...args) {
-                // Don't log anything that could trigger devtools detection
-                if (args.some(arg => typeof arg === 'object' && arg !== null)) {
-                    return originalConsoleLog.apply(this, args.map(a => typeof a === 'object' ? '[Object]' : a));
-                }
-                return originalConsoleLog.apply(this, args);
-            };
-
-            // 34. Document.hasFocus() - always return true
-            document.hasFocus = () => true;
-
-            // 35. Performance.now() noise (timing attack protection)
-            const originalPerformanceNow = performance.now.bind(performance);
-            performance.now = function() {
-                return originalPerformanceNow() + Math.random() * 0.1;
-            };
-
-            // 36. requestAnimationFrame timing normalization
-            const originalRAF = window.requestAnimationFrame;
-            window.requestAnimationFrame = function(callback) {
-                return originalRAF.call(window, function(timestamp) {
-                    callback(timestamp + Math.random() * 0.1);
-                });
-            };
-
-            // 37. Per-session unique canvas fingerprint
-            const sessionNoise = Math.random() * 0.1;
-            const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-            HTMLCanvasElement.prototype.toDataURL = function(type) {
-                const ctx = this.getContext('2d');
-                if (ctx && this.width > 0 && this.height > 0) {
-                    try {
-                        const imageData = ctx.getImageData(0, 0, Math.min(this.width, 10), Math.min(this.height, 10));
-                        for (let i = 0; i < imageData.data.length; i += 4) {
-                            imageData.data[i] = Math.max(0, Math.min(255, imageData.data[i] + (sessionNoise > 0.05 ? 1 : -1)));
-                        }
-                        ctx.putImageData(imageData, 0, 0);
-                    } catch(e) {}
-                }
-                return origToDataURL.apply(this, arguments);
-            };
-
-            // 38. WebGL renderer randomization per session
-            const gpuRenderers = [
-                'Intel(R) Iris(R) Xe Graphics',
-                'Intel(R) UHD Graphics 620',
-                'Intel(R) HD Graphics 630',
-                'NVIDIA GeForce GTX 1650',
-                'AMD Radeon RX 580'
-            ];
-            const sessionRenderer = gpuRenderers[Math.floor(Math.random() * gpuRenderers.length)];
-
-            // Re-apply with session-specific renderer
-            const getParamProxyAdvanced = new Proxy(WebGLRenderingContext.prototype.getParameter, {
-                apply: function(target, thisArg, args) {
-                    if (args[0] === 37445) return 'Intel Inc.';
-                    if (args[0] === 37446) return sessionRenderer;
-                    return Reflect.apply(target, thisArg, args);
-                }
-            });
-            WebGLRenderingContext.prototype.getParameter = getParamProxyAdvanced;
-
-            // 39. Keyboard event timing humanization
-            const originalAddEventListener = EventTarget.prototype.addEventListener;
-            EventTarget.prototype.addEventListener = function(type, listener, options) {
-                if (type === 'keydown' || type === 'keyup' || type === 'keypress') {
-                    const wrappedListener = function(event) {
-                        // Add micro-delay to simulate human reaction time variance
-                        setTimeout(() => listener.call(this, event), Math.random() * 5);
-                    };
-                    return originalAddEventListener.call(this, type, wrappedListener, options);
-                }
-                return originalAddEventListener.call(this, type, listener, options);
-            };
-
-            // 40. Storage quota fingerprint protection
-            if (navigator.storage && navigator.storage.estimate) {
-                const origEstimate = navigator.storage.estimate.bind(navigator.storage);
-                navigator.storage.estimate = async function() {
-                    const result = await origEstimate();
-                    // Return slightly randomized values
-                    return {
-                        quota: result.quota || 1073741824,
-                        usage: Math.floor(Math.random() * 1000000),
-                        usageDetails: {}
-                    };
-                };
-            }
-
-            // 41. Screen orientation lock (mobile detection)
-            if (screen.orientation) {
-                Object.defineProperty(screen.orientation, 'type', { get: () => 'landscape-primary' });
-                Object.defineProperty(screen.orientation, 'angle', { get: () => 0 });
-            }
-
-            // 42. Bluetooth API protection
-            if (navigator.bluetooth) {
-                navigator.bluetooth.getAvailability = () => Promise.resolve(false);
-                navigator.bluetooth.requestDevice = () => Promise.reject(new Error('User cancelled'));
-            }
-
-            // 43. USB API protection
-            if (navigator.usb) {
-                navigator.usb.getDevices = () => Promise.resolve([]);
-                navigator.usb.requestDevice = () => Promise.reject(new Error('No device selected'));
-            }
-
-            // 44. Serial API protection
-            if (navigator.serial) {
-                navigator.serial.getPorts = () => Promise.resolve([]);
-                navigator.serial.requestPort = () => Promise.reject(new Error('No port selected'));
-            }
-
-            // 45. HID API protection
-            if (navigator.hid) {
-                navigator.hid.getDevices = () => Promise.resolve([]);
-                navigator.hid.requestDevice = () => Promise.reject(new Error('No device selected'));
-            }
-
-            // 46. Gamepad API protection
-            navigator.getGamepads = () => [null, null, null, null];
-
-            // 47. Credential API protection
-            if (navigator.credentials) {
-                navigator.credentials.get = () => Promise.resolve(null);
-                navigator.credentials.store = () => Promise.resolve();
-            }
-
-            // 48. Payment API protection
-            if (window.PaymentRequest) {
-                window.PaymentRequest = class {
-                    constructor() { throw new Error('Not supported'); }
-                };
-            }
-
-            // 49. Network Information randomization
-            if (navigator.connection) {
-                const connectionTypes = ['wifi', '4g', 'ethernet'];
-                const sessionConnectionType = connectionTypes[Math.floor(Math.random() * connectionTypes.length)];
-                Object.defineProperty(navigator.connection, 'type', { get: () => sessionConnectionType });
-            }
-
-            // 50. Beacon API tracking (allow but log nothing)
-            const origSendBeacon = navigator.sendBeacon;
-            navigator.sendBeacon = function(url, data) {
-                // Allow beacon but could be used for fingerprinting
-                return origSendBeacon.call(this, url, data);
-            };
-
-            console.log('[Stealth] Ultimate anti-detection initialized (50 evasions active) - Session: ' + Math.random().toString(36).substr(2, 8));
-        "#)
-        .await
-        .map_err(|e| BrowserError::JavaScriptError(e.to_string()))?;
-
-        debug!("Stealth anti-detection scripts injected");
-        Ok(())
-    }
-
-    /// Inject session-specific evasions that match the actual User-Agent
-    /// Overrides navigator.userAgentData, platform, etc. to be consistent
-    async fn inject_session_specific_evasions(page: &Page, user_agent: &str) -> Result<(), BrowserError> {
-        let chrome_version = extract_chrome_version(user_agent);
-        let is_edge = is_edge_ua(user_agent);
-        let platform = extract_platform(user_agent);
-
-        // Determine navigator.platform value
-        let nav_platform = match platform {
-            "Windows" => "Win32",
-            "macOS" => "MacIntel",
-            "Linux" => "Linux x86_64",
-            _ => "Win32",
+    /// Set full CDP headers to ensure Sec-CH-UA-Platform and Accept-Language match the profile.
+    /// ChaserPage::apply_profile() only sets user_agent string — it does NOT set metadata.
+    /// Without this, Chrome sends the REAL OS in Sec-CH-UA-Platform headers.
+    ///
+    /// IMPORTANT: Brand string must use "Not=A?Brand" to match ChaserProfile's bootstrap_script
+    /// (profiles.rs line 292). Any mismatch between JS-level userAgentData.brands and
+    /// HTTP-level Sec-CH-UA headers is a detection vector.
+    ///
+    /// NOTE: We do NOT set Sec-CH-UA via SetExtraHttpHeaders because
+    /// SetUserAgentOverrideParams with user_agent_metadata already handles all
+    /// Sec-CH-UA-* headers. Double-setting them causes conflicts.
+    async fn set_cdp_headers(page: &Page, profile: &ChaserProfile, full_version: &str) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::emulation::{
+            SetUserAgentOverrideParams, UserAgentMetadata, UserAgentBrandVersion,
+        };
+        use chaser_oxide::cdp::browser_protocol::network::{
+            SetExtraHttpHeadersParams, Headers,
         };
 
-        // Build browser brand name
-        let browser_brand = if is_edge { "Microsoft Edge" } else { "Google Chrome" };
+        let major = profile.chrome_version().to_string();
 
-        // Full version string
-        let full_version = format!("{}.0.0.0", chrome_version);
-
-        let script = format!(r#"
-            // === SESSION-SPECIFIC EVASIONS (matching User-Agent) ===
-
-            // Override navigator.userAgentData to match selected UA
-            if (navigator.userAgentData || true) {{
-                Object.defineProperty(navigator, 'userAgentData', {{
-                    get: () => ({{
-                        brands: [
-                            {{ brand: '{browser_brand}', version: '{chrome_version}' }},
-                            {{ brand: 'Chromium', version: '{chrome_version}' }},
-                            {{ brand: 'Not_A Brand', version: '24' }}
-                        ],
-                        mobile: false,
-                        platform: '{platform}',
-                        getHighEntropyValues: (hints) => Promise.resolve({{
-                            architecture: 'x86',
-                            bitness: '64',
-                            brands: [
-                                {{ brand: '{browser_brand}', version: '{chrome_version}' }},
-                                {{ brand: 'Chromium', version: '{chrome_version}' }},
-                                {{ brand: 'Not_A Brand', version: '24' }}
-                            ],
-                            fullVersionList: [
-                                {{ brand: '{browser_brand}', version: '{full_version}' }},
-                                {{ brand: 'Chromium', version: '{full_version}' }},
-                                {{ brand: 'Not_A Brand', version: '24.0.0.0' }}
-                            ],
-                            mobile: false,
-                            model: '',
-                            platform: '{platform}',
-                            platformVersion: '15.0.0',
-                            uaFullVersion: '{full_version}'
-                        }}),
-                        toJSON: () => ({{
-                            brands: [
-                                {{ brand: '{browser_brand}', version: '{chrome_version}' }},
-                                {{ brand: 'Chromium', version: '{chrome_version}' }},
-                                {{ brand: 'Not_A Brand', version: '24' }}
-                            ],
-                            mobile: false,
-                            platform: '{platform}'
-                        }})
-                    }}),
-                    configurable: true
-                }});
-            }}
-
-            // Override navigator.platform to match UA
-            Object.defineProperty(navigator, 'platform', {{ get: () => '{nav_platform}', configurable: true }});
-
-            console.log('[Stealth] Session-specific evasions applied - {browser_brand}/{chrome_version} on {platform}');
-        "#,
-            browser_brand = browser_brand,
-            chrome_version = chrome_version,
-            full_version = full_version,
-            platform = platform,
-            nav_platform = nav_platform,
+        // Build the REAL User-Agent with full version (not .0.0.0 which ChaserProfile uses)
+        // Real Chrome: "Chrome/142.0.7444.175" not "Chrome/142.0.0.0"
+        let real_ua = format!(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{} Safari/537.36",
+            full_version
         );
 
-        page.evaluate(script)
-            .await
-            .map_err(|e| BrowserError::JavaScriptError(format!("Session evasion injection failed: {}", e)))?;
-
-        debug!("Session-specific evasions injected: {}/{} on {}", browser_brand, chrome_version, platform);
-        Ok(())
-    }
-
-    /// Set consistent HTTP headers via CDP to match the selected User-Agent and Saudi Arabia region
-    async fn set_cdp_headers(page: &Page, user_agent: &str) -> Result<(), BrowserError> {
-        use chromiumoxide::cdp::browser_protocol::network::{
-            EnableParams, SetExtraHttpHeadersParams, Headers,
+        // 1) SetUserAgentOverride with FULL metadata (platform, brands, accept-language)
+        // Brand string "Not=A?Brand" matches ChaserProfile bootstrap_script exactly
+        let ua_params = SetUserAgentOverrideParams {
+            user_agent: real_ua,
+            accept_language: Some("ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7".to_string()),
+            platform: Some("Linux x86_64".to_string()),
+            user_agent_metadata: Some(UserAgentMetadata {
+                brands: Some(vec![
+                    UserAgentBrandVersion::new("Google Chrome", &major),
+                    UserAgentBrandVersion::new("Chromium", &major),
+                    UserAgentBrandVersion::new("Not=A?Brand", "24"),
+                ]),
+                full_version_list: Some(vec![
+                    UserAgentBrandVersion::new("Google Chrome", full_version),
+                    UserAgentBrandVersion::new("Chromium", full_version),
+                    UserAgentBrandVersion::new("Not=A?Brand", "24.0.0.0"),
+                ]),
+                platform: "Linux".to_string(),
+                platform_version: "6.1.0".to_string(),
+                architecture: "x86".to_string(),
+                model: String::new(),
+                mobile: false,
+                bitness: Some("64".to_string()),
+                wow64: Some(false),
+                form_factors: None,
+            }),
         };
 
-        // Enable Network domain (required before setting headers)
-        page.execute(EnableParams::default())
+        page.execute(ua_params)
             .await
-            .map_err(|e| BrowserError::JavaScriptError(format!("Failed to enable Network domain: {}", e)))?;
+            .map_err(|e| BrowserError::LaunchFailed(format!("Failed to set UA override: {}", e)))?;
 
-        let chrome_version = extract_chrome_version(user_agent);
-        let platform = extract_platform(user_agent);
-
-        // Build Sec-CH-UA header consistent with the selected User-Agent
-        let sec_ch_ua = if is_edge_ua(user_agent) {
-            format!("\"Microsoft Edge\";v=\"{}\", \"Chromium\";v=\"{}\", \"Not_A Brand\";v=\"24\"", chrome_version, chrome_version)
-        } else {
-            format!("\"Google Chrome\";v=\"{}\", \"Chromium\";v=\"{}\", \"Not_A Brand\";v=\"24\"", chrome_version, chrome_version)
-        };
-
-        // Build headers JSON map - Saudi Arabia region headers
+        // 2) Only set Accept-Language via SetExtraHttpHeaders.
+        // Sec-CH-UA headers are handled by user_agent_metadata above.
+        // Setting them in BOTH places causes double-header conflicts.
         let headers_json = serde_json::json!({
-            "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Sec-CH-UA": sec_ch_ua,
-            "Sec-CH-UA-Mobile": "?0",
-            "Sec-CH-UA-Platform": format!("\"{}\"", platform),
+            "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7"
         });
 
-        let params = SetExtraHttpHeadersParams::new(Headers::new(headers_json));
-        page.execute(params)
+        let extra_headers = SetExtraHttpHeadersParams::new(Headers::new(headers_json));
+        page.execute(extra_headers)
             .await
-            .map_err(|e| BrowserError::JavaScriptError(format!("Failed to set CDP headers: {}", e)))?;
+            .map_err(|e| BrowserError::LaunchFailed(format!("Failed to set extra headers: {}", e)))?;
 
-        info!("CDP headers set - Sec-CH-UA: {}/{}, Platform: {}, Accept-Language: ar-SA",
-              if is_edge_ua(user_agent) { "Edge" } else { "Chrome" }, chrome_version, platform);
+        debug!("CDP headers set: Chrome/{}, Platform=Linux, Accept-Language=ar-SA", full_version);
         Ok(())
     }
+
+    /// Set timezone to Asia/Riyadh via CDP Emulation (no JavaScript modification).
+    /// This makes Date.getTimezoneOffset() return -180 and
+    /// Intl.DateTimeFormat().resolvedOptions().timeZone return "Asia/Riyadh"
+    /// at the browser engine level — completely invisible to detection scripts.
+    async fn set_timezone_override(page: &Page) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::emulation::SetTimezoneOverrideParams;
+
+        let tz_params = SetTimezoneOverrideParams::new("Asia/Riyadh");
+        page.execute(tz_params)
+            .await
+            .map_err(|e| BrowserError::LaunchFailed(format!("Failed to set timezone override: {}", e)))?;
+
+        debug!("CDP timezone override set: Asia/Riyadh (UTC+3, offset -180)");
+        Ok(())
+    }
+
+    /// Inject additional anti-detection evasions via AddScriptToEvaluateOnNewDocument.
+    /// This persists across navigations and does NOT trigger Runtime.enable.
+    /// ChaserProfile bootstrap covers ~12 evasions; we add ~25 more here.
+    ///
+    /// Also injects a dynamic script to patch navigator.userAgentData.getHighEntropyValues(),
+    /// which ChaserProfile's bootstrap destroys by replacing userAgentData with a plain object.
+    /// Google calls getHighEntropyValues() to get full version + platform details.
+    async fn inject_extra_evasions(page: &Page, chrome_major: u32, full_version: &str) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
+
+        // 1) Static evasions (28 sections covering fingerprint surfaces)
+        let evasion_script = include_str!("../../evasions/extra_evasions.js");
+
+        let params = AddScriptToEvaluateOnNewDocumentParams {
+            source: evasion_script.to_string(),
+            world_name: None,
+            include_command_line_api: None,
+            run_immediately: None,
+        };
+
+        page.execute(params)
+            .await
+            .map_err(|e| BrowserError::LaunchFailed(format!("Failed to inject extra evasions: {}", e)))?;
+
+        // 2) Dynamic script: Fix navigator.userAgentData after ChaserProfile's bootstrap
+        //
+        // ChaserProfile's bootstrap replaces navigator.userAgentData with a plain object
+        // that only has {brands, mobile, platform}. Real Chrome's NavigatorUAData also has
+        // getHighEntropyValues() and toJSON(). Google uses getHighEntropyValues() to get
+        // the full version, architecture, bitness, etc.
+        //
+        // We need runtime values (full_version) so this can't be in the static JS file.
+        let uad_patch = format!(
+            r#"(function() {{
+                'use strict';
+                try {{
+                    const uad = navigator.userAgentData;
+                    if (uad && !uad.getHighEntropyValues) {{
+                        const fullVer = "{full_ver}";
+                        const major = "{major}";
+                        uad.getHighEntropyValues = function(hints) {{
+                            const result = {{
+                                brands: uad.brands,
+                                mobile: uad.mobile,
+                                platform: uad.platform,
+                            }};
+                            if (hints.includes('fullVersionList')) {{
+                                result.fullVersionList = [
+                                    {{ brand: "Google Chrome", version: fullVer }},
+                                    {{ brand: "Chromium", version: fullVer }},
+                                    {{ brand: "Not=A?Brand", version: "24.0.0.0" }}
+                                ];
+                            }}
+                            if (hints.includes('platformVersion')) result.platformVersion = "6.1.0";
+                            if (hints.includes('architecture')) result.architecture = "x86";
+                            if (hints.includes('bitness')) result.bitness = "64";
+                            if (hints.includes('model')) result.model = "";
+                            if (hints.includes('uaFullVersion')) result.uaFullVersion = fullVer;
+                            if (hints.includes('wow64')) result.wow64 = false;
+                            if (hints.includes('formFactors')) result.formFactors = [];
+                            return Promise.resolve(result);
+                        }};
+                        uad.toJSON = function() {{
+                            return {{ brands: uad.brands, mobile: uad.mobile, platform: uad.platform }};
+                        }};
+                    }}
+                }} catch(e) {{}}
+            }})();"#,
+            full_ver = full_version,
+            major = chrome_major,
+        );
+
+        let uad_params = AddScriptToEvaluateOnNewDocumentParams {
+            source: uad_patch,
+            world_name: None,
+            include_command_line_api: None,
+            run_immediately: None,
+        };
+
+        page.execute(uad_params)
+            .await
+            .map_err(|e| BrowserError::LaunchFailed(format!("Failed to inject UAD patch: {}", e)))?;
+
+        debug!("Extra anti-detection evasions injected (25+ evasions + UAD patch, Chrome {})", full_version);
+        Ok(())
+    }
+
+    /// Override geolocation to Riyadh, Saudi Arabia via CDP
+    async fn set_geolocation_riyadh(page: &Page) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::emulation::SetGeolocationOverrideParams;
+
+        let params = SetGeolocationOverrideParams::builder()
+            .latitude(24.7136)
+            .longitude(46.6753)
+            .accuracy(100.0)
+            .build();
+
+        page.execute(params)
+            .await
+            .map_err(|e| BrowserError::JavaScriptError(format!("Failed to set geolocation: {}", e)))?;
+
+        info!("Geolocation overridden to Riyadh (24.7136, 46.6753)");
+        Ok(())
+    }
+
+    // Anti-detection approach: ZERO JavaScript modifications
+    //
+    // Google detects JS prototype modifications (navigator overrides, toString patches, etc.)
+    // Before chaser-oxide: CAPTCHAs were rare. After: CAPTCHAs on every search.
+    // Root cause: bootstrap_script + extra_evasions.js modified ~37 JS prototypes.
+    //
+    // New approach — CDP-level only (invisible to JavaScript):
+    // 1. Auto-detect Chrome version from installed binary (MUST match real browser)
+    // 2. SetUserAgentOverrideParams — UA string, Accept-Language, platform, userAgentMetadata
+    //    (handles navigator.userAgent, navigator.language, navigator.languages, Sec-CH-UA-*)
+    // 3. SetTimezoneOverrideParams — Asia/Riyadh timezone at browser engine level
+    //    (handles Date.getTimezoneOffset, Intl.DateTimeFormat natively)
+    // 4. Emulation.setGeolocationOverride — Riyadh coordinates
+    // 5. Chrome flag: --disable-blink-features=AutomationControlled
+    //    (handles navigator.webdriver=false at C++ level)
+    //
+    // NO JavaScript overrides. NO prototype modifications. NO toString patches.
+    // The browser runs as genuine Chrome/Chromium with its real fingerprint.
 
     /// Block unnecessary resources via CDP to reduce proxy bandwidth consumption
     ///
@@ -1560,7 +1394,7 @@ impl BrowserSession {
     ///
     /// NOTE: Google Ads services are NOT blocked (googleadservices.com, googlesyndication.com)
     async fn block_unnecessary_resources(page: &Page) -> Result<(), BrowserError> {
-        use chromiumoxide::cdp::browser_protocol::network::SetBlockedUrLsParams;
+        use chaser_oxide::cdp::browser_protocol::network::SetBlockedUrLsParams;
 
         let blocked_urls = vec![
             // Analytics & tracking (NOT related to Google Ads)
@@ -1584,6 +1418,22 @@ impl BrowserSession {
             "platform.twitter.com/*".to_string(),
             "connect.facebook.net/*".to_string(),
             "*.linkedin.com/li.lms-analytics/*".to_string(),
+            // Ad networks (NOT Google Ads — those are needed for click tracking)
+            // These cause proxy 522 timeouts during warm-up browsing
+            "*.taboola.com/*".to_string(),
+            "*.taboolasyndication.com/*".to_string(),
+            "*.pubmatic.com/*".to_string(),
+            "*.outbrain.com/*".to_string(),
+            "*.criteo.com/*".to_string(),
+            "*.criteo.net/*".to_string(),
+            "*.adsrvr.org/*".to_string(),
+            "*.moatads.com/*".to_string(),
+            "*.rubiconproject.com/*".to_string(),
+            "*.openx.net/*".to_string(),
+            "*.bidswitch.net/*".to_string(),
+            "*.casalemedia.com/*".to_string(),
+            "*.amazon-adsystem.com/*".to_string(),
+            "*.adnxs.com/*".to_string(),
             // Video embeds (heavy bandwidth)
             "*.youtube.com/embed/*".to_string(),
             "*.vimeo.com/*".to_string(),

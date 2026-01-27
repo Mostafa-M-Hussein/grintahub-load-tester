@@ -49,6 +49,9 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
   // Password visibility toggle
   const [showProxyPassword, setShowProxyPassword] = useState(false);
+  // Manual test browser state
+  const [testBrowserId, setTestBrowserId] = useState<string | null>(null);
+  const [testBrowserLoading, setTestBrowserLoading] = useState(false);
 
   // Sync local state when parent config changes (e.g., after loading from backend)
   useEffect(() => {
@@ -135,6 +138,31 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
       days.sort();
     }
     handleScheduleChange('days', days);
+  };
+
+  // Manual test browser handlers
+  const handleOpenTestBrowser = async () => {
+    setTestBrowserLoading(true);
+    try {
+      const sessionId = await api.openTestBrowser();
+      setTestBrowserId(sessionId);
+    } catch (e: any) {
+      console.error('Failed to open test browser:', e);
+      alert('Failed to open test browser: ' + (e.message || e));
+    } finally {
+      setTestBrowserLoading(false);
+    }
+  };
+
+  const handleCloseTestBrowser = async () => {
+    if (testBrowserId) {
+      try {
+        await api.closeTestBrowser(testBrowserId);
+      } catch (e: any) {
+        console.error('Failed to close test browser:', e);
+      }
+      setTestBrowserId(null);
+    }
   };
 
   const handleTestProxy = async () => {
@@ -337,8 +365,7 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
             </div>
           )}
 
-          {/* Manual Test Browser - HIDDEN for now (will enable later) */}
-          {/*
+          {/* Manual Test Browser */}
           <div className="test-browser-section" style={{ marginTop: '15px', paddingTop: '15px', borderTop: '1px solid #333' }}>
             <div style={{ marginBottom: '8px', fontSize: '0.9em', color: '#888' }}>
               Manual Test: Open a browser with proxy to test manually
@@ -367,7 +394,6 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
               </div>
             )}
           </div>
-          */}
         </div>
       </fieldset>
 

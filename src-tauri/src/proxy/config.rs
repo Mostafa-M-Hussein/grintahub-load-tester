@@ -4,8 +4,8 @@
 pub const DEFAULT_HOST: &str = "pr.oxylabs.io";
 /// Default port for HTTP proxy (more reliable for browsers with auth)
 pub const DEFAULT_PORT: u16 = 60000;
-/// Default session time in minutes
-pub const DEFAULT_SESSTIME: u16 = 10;
+/// Default session time in minutes (30 min avoids mid-session IP changes)
+pub const DEFAULT_SESSTIME: u16 = 30;
 
 /// Proxy configuration for Oxylabs
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

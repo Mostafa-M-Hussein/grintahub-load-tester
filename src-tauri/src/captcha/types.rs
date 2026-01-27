@@ -50,6 +50,10 @@ pub struct CaptchaRequest {
     pub action: Option<String>,
     pub min_score: Option<f64>,
     pub enterprise: bool,
+    /// The `data-s` parameter from Google's /sorry/ page reCAPTCHA.
+    /// This is a one-time-use token that MUST be passed to 2Captcha for
+    /// Google sorry pages, otherwise the solved token will be rejected.
+    pub data_s: Option<String>,
 }
 
 impl CaptchaRequest {
@@ -62,6 +66,7 @@ impl CaptchaRequest {
             action: None,
             min_score: None,
             enterprise: false,
+            data_s: None,
         }
     }
 
@@ -74,6 +79,22 @@ impl CaptchaRequest {
             action: None,
             min_score: None,
             enterprise: true,
+            data_s: None,
+        }
+    }
+
+    /// Create reCAPTCHA v2 Enterprise request with data-s parameter.
+    /// The data-s value is critical for Google /sorry/ pages - without it,
+    /// the solved token will be rejected by Google.
+    pub fn recaptcha_v2_enterprise_with_data_s(sitekey: &str, page_url: &str, data_s: &str) -> Self {
+        Self {
+            captcha_type: CaptchaType::RecaptchaV2,
+            sitekey: sitekey.to_string(),
+            page_url: page_url.to_string(),
+            action: None,
+            min_score: None,
+            enterprise: true,
+            data_s: Some(data_s.to_string()),
         }
     }
 
@@ -86,6 +107,7 @@ impl CaptchaRequest {
             action: Some(action.to_string()),
             min_score: Some(min_score),
             enterprise: false,
+            data_s: None,
         }
     }
 
@@ -98,6 +120,7 @@ impl CaptchaRequest {
             action: None,
             min_score: None,
             enterprise: false,
+            data_s: None,
         }
     }
 
@@ -160,6 +183,11 @@ pub enum TwoCaptchaTask {
         website_url: String,
         #[serde(rename = "websiteKey")]
         website_key: String,
+        /// The data-s parameter from Google's /sorry/ page. One-time-use token
+        /// that must be passed for Google CAPTCHA pages, otherwise the solved
+        /// token is rejected. Omitted from JSON when None.
+        #[serde(rename = "recaptchaDataSValue", skip_serializing_if = "Option::is_none")]
+        recaptcha_data_s_value: Option<String>,
     },
 
     #[serde(rename = "RecaptchaV3TaskProxyless")]
