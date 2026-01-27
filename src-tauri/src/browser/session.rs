@@ -214,7 +214,7 @@ impl BrowserSessionConfig {
         // Check if the key is already set correctly — skip write to avoid triggering
         // Tauri dev watcher rebuild loop
         if content.contains(&expected_line) {
-            info!("2Captcha extension already configured with correct API key ({}...)", &api_key[..api_key.len().min(8)]);
+            info!("2Captcha extension already configured with correct API key ({}...)", crate::safe_truncate(api_key, 8));
             return Ok(());
         }
 
@@ -228,7 +228,7 @@ impl BrowserSessionConfig {
         std::fs::write(&config_path, &updated)
             .map_err(|e| format!("Failed to write config.js: {}", e))?;
 
-        info!("2Captcha extension configured with API key ({}...)", &api_key[..api_key.len().min(8)]);
+        info!("2Captcha extension configured with API key ({}...)", crate::safe_truncate(api_key, 8));
         Ok(())
     }
 
@@ -491,6 +491,9 @@ impl BrowserSession {
 
         // Override geolocation to Riyadh (24.7136°N, 46.6753°E) via CDP
         Self::set_geolocation_riyadh(chaser.raw_page()).await?;
+
+        // 4) Pre-set Google cookies to look like a returning user (not a fresh bot)
+        Self::pre_set_google_cookies(chaser.raw_page()).await?;
 
         // Block unnecessary resources to reduce proxy bandwidth consumption
         Self::block_unnecessary_resources(chaser.raw_page()).await?;
@@ -1160,7 +1163,7 @@ impl BrowserSession {
                 .unwrap_or_default();
 
             info!("Parsed proxy credentials - host: {}, port: {}, user: {}..., pass_len: {}",
-                   host, port, &username[..username.len().min(30)], password.len());
+                   host, port, crate::safe_truncate(&username, 30), password.len());
 
             Some((host, port, username, password))
         } else {
@@ -1362,6 +1365,58 @@ impl BrowserSession {
             .map_err(|e| BrowserError::JavaScriptError(format!("Failed to set geolocation: {}", e)))?;
 
         info!("Geolocation overridden to Riyadh (24.7136, 46.6753)");
+        Ok(())
+    }
+
+    /// Pre-set Google cookies via CDP to look like a returning user.
+    /// A fresh browser with zero cookies is a strong bot signal to Google.
+    /// Sets CONSENT (accepted cookies) and PREF (language/country) before any navigation.
+    async fn pre_set_google_cookies(page: &Page) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::network::{SetCookiesParams, CookieParam};
+
+        let cookies = vec![
+            // CONSENT cookie — tells Google consent dialog was already accepted
+            CookieParam::builder()
+                .name("CONSENT")
+                .value("PENDING+987")
+                .domain(".google.com.sa")
+                .path("/")
+                .secure(true)
+                .build()
+                .map_err(|e| BrowserError::LaunchFailed(format!("Cookie build error: {}", e)))?,
+            // Also set for .google.com (some redirects go through google.com)
+            CookieParam::builder()
+                .name("CONSENT")
+                .value("PENDING+987")
+                .domain(".google.com")
+                .path("/")
+                .secure(true)
+                .build()
+                .map_err(|e| BrowserError::LaunchFailed(format!("Cookie build error: {}", e)))?,
+            // PREF cookie — sets language to Arabic and country to Saudi Arabia
+            CookieParam::builder()
+                .name("PREF")
+                .value("hl=ar&gl=SA")
+                .domain(".google.com.sa")
+                .path("/")
+                .secure(true)
+                .build()
+                .map_err(|e| BrowserError::LaunchFailed(format!("Cookie build error: {}", e)))?,
+            CookieParam::builder()
+                .name("PREF")
+                .value("hl=ar&gl=SA")
+                .domain(".google.com")
+                .path("/")
+                .secure(true)
+                .build()
+                .map_err(|e| BrowserError::LaunchFailed(format!("Cookie build error: {}", e)))?,
+        ];
+
+        page.execute(SetCookiesParams::new(cookies))
+            .await
+            .map_err(|e| BrowserError::LaunchFailed(format!("Failed to set Google cookies: {}", e)))?;
+
+        info!("Pre-set Google cookies (CONSENT, PREF) for .google.com.sa and .google.com");
         Ok(())
     }
 

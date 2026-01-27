@@ -98,7 +98,7 @@ impl LocalProxyForwarder {
             "****".to_string()
         };
         info!("Auth for user '{}', pass: '{}' (len={})",
-               &self.username[..self.username.len().min(40)],
+               crate::safe_truncate(&self.username, 40),
                pass_preview,
                self.password.len());
         format!("Basic {}", encoded)

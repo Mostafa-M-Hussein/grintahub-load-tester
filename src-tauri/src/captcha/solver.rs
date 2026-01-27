@@ -197,9 +197,9 @@ impl CaptchaSolver {
         debug!("2Captcha createTask request: type={:?}, enterprise={}, data_s={}, url={}, sitekey={}...",
             request.captcha_type,
             request.enterprise,
-            request.data_s.as_ref().map(|s| format!("{}...", &s[..s.len().min(20)])).unwrap_or_else(|| "none".to_string()),
-            &request.page_url[..request.page_url.len().min(80)],
-            &request.sitekey[..request.sitekey.len().min(20)]
+            request.data_s.as_ref().map(|s| format!("{}...", crate::safe_truncate(s, 20))).unwrap_or_else(|| "none".to_string()),
+            crate::safe_truncate(&request.page_url, 80),
+            crate::safe_truncate(&request.sitekey, 20)
         );
 
         let response = self.client
@@ -213,10 +213,10 @@ impl CaptchaSolver {
         let response_text = response.text().await
             .map_err(|e| CaptchaError::NetworkError(e.to_string()))?;
 
-        debug!("2Captcha createTask response: {}", &response_text[..response_text.len().min(500)]);
+        debug!("2Captcha createTask response: {}", crate::safe_truncate(&response_text, 500));
 
         let result: TwoCaptchaCreateResponse = serde_json::from_str(&response_text)
-            .map_err(|e| CaptchaError::InvalidResponse(format!("Parse error: {} - Response: {}", e, &response_text[..response_text.len().min(200)])))?;
+            .map_err(|e| CaptchaError::InvalidResponse(format!("Parse error: {} - Response: {}", e, crate::safe_truncate(&response_text, 200))))?;
 
         if result.error_id != 0 {
             // Build detailed error message

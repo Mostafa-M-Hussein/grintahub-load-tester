@@ -147,7 +147,7 @@ impl AuthClient {
         info!("Registration response status: {}", status);
         info!("Registration response URL: {}", response_url);
         info!("Registration response length: {} bytes", text.len());
-        debug!("Registration response body: {}", &text[..text.len().min(2000)]);
+        debug!("Registration response body: {}", crate::safe_truncate(&text, 2000));
 
         // Try to parse as JSON
         if let Ok(auth_response) = serde_json::from_str::<AuthResponse>(&text) {
@@ -320,7 +320,7 @@ impl AuthClient {
         let text = response.text().await
             .map_err(|e| AuthError::NetworkError(e.to_string()))?;
 
-        debug!("Login response ({}): {}", status, &text[..text.len().min(500)]);
+        debug!("Login response ({}): {}", status, crate::safe_truncate(&text, 500));
 
         // Try to parse as JSON
         if let Ok(auth_response) = serde_json::from_str::<AuthResponse>(&text) {
@@ -370,7 +370,7 @@ impl AuthClient {
             return Err(AuthError::RateLimited);
         }
 
-        Err(AuthError::LoginFailed(format!("Unknown error: {}", &text[..text.len().min(200)])))
+        Err(AuthError::LoginFailed(format!("Unknown error: {}", crate::safe_truncate(&text, 200))))
     }
 
     /// Register with automatic CAPTCHA solving
@@ -462,7 +462,7 @@ impl AuthClient {
         info!("Registration response length: {} bytes", text.len());
 
         // Log first 500 chars of response for debugging
-        debug!("Registration response preview: {}", &text[..text.len().min(500)]);
+        debug!("Registration response preview: {}", crate::safe_truncate(&text, 500));
 
         // Check for success - redirect to home/dashboard/verify or main page
         if response_url.contains("/home")

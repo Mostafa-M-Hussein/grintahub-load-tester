@@ -266,7 +266,7 @@ pub async fn fetch_ip_without_proxy() -> Result<String, String> {
 
 /// Fetch IP with proxy using explicit basic auth
 pub async fn fetch_ip_with_proxy(proxy_host: &str, username: &str, password: &str) -> Result<String, String> {
-    info!("Proxy test: connecting via {} (user: {}...)", proxy_host, &username[..username.len().min(30)]);
+    info!("Proxy test: connecting via {} (user: {}...)", proxy_host, crate::safe_truncate(username, 30));
 
     let proxy = reqwest::Proxy::all(proxy_host)
         .map_err(|e| format!("Invalid proxy URL: {}", e))?
@@ -429,7 +429,7 @@ pub async fn test_captcha_logic(state: &AppState) -> Result<CaptchaTestResult, S
                 success: true,
                 solve_time_ms: result.solve_time_ms,
                 total_time_ms: test_time_ms,
-                token_preview: result.token[..result.token.len().min(50)].to_string(),
+                token_preview: crate::safe_truncate(&result.token, 50).to_string(),
                 error: None,
             })
         }

@@ -14,6 +14,20 @@ pub mod supervisor;
 pub mod bot;
 pub mod web;
 
+/// Safely truncate a string to at most `max_bytes` bytes, cutting at a char boundary.
+/// Prevents panics when slicing strings containing multi-byte characters (Arabic, RTL marks, etc.).
+#[inline]
+pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(feature = "desktop")]
 mod commands;
 

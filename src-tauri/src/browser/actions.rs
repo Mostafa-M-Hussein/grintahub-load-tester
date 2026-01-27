@@ -12,6 +12,7 @@ use rand::{Rng, SeedableRng};
 use tracing::{info, debug, warn, error};
 
 use super::{BrowserSession, BrowserError};
+use crate::safe_truncate;
 
 /// Google account credentials for login
 #[derive(Debug, Clone)]
@@ -252,8 +253,8 @@ impl BrowserActions {
 
         info!("Session {} CAPTCHA page: google_sorry={}, enterprise={}, method={}, data_s={}, forms={}, callback={:?}, url={}",
             session.id, is_google_sorry, is_enterprise, method,
-            data_s.as_ref().map(|s| format!("{}...({}chars)", &s[..s.len().min(20)], s.len())).unwrap_or_else(|| "NONE".to_string()),
-            form_count, callback_name, &page_url[..page_url.len().min(80)]);
+            data_s.as_ref().map(|s| format!("{}...({}chars)", safe_truncate(s, 20), s.len())).unwrap_or_else(|| "NONE".to_string()),
+            form_count, callback_name, safe_truncate(&page_url, 80));
         debug!("Session {} page body: {}", session.id, body_preview);
 
         let sitekey = match captcha_info.get("sitekey").and_then(|v| v.as_str()) {
@@ -264,7 +265,7 @@ impl BrowserActions {
             }
         };
 
-        info!("Session {} found sitekey: {} (via {})", session.id, &sitekey[..sitekey.len().min(20)], method);
+        info!("Session {} found sitekey: {} (via {})", session.id, safe_truncate(&sitekey, 20), method);
 
         // 2. Create solver and solve reCAPTCHA v2
         let solver = match crate::captcha::CaptchaSolver::new(captcha_api_key) {
@@ -761,7 +762,7 @@ impl BrowserActions {
         // }
 
         // Navigate to Google Saudi Arabia
-        session.navigate("https://www.google.com.sa/").await?;
+        session.navigate("https://www.google.com.sa/?hl=ar&gl=sa").await?;
 
         // Wait for page to load (longer with proxy latency)
         Self::human_delay(2000, 1000).await;
@@ -960,7 +961,7 @@ impl BrowserActions {
             if let Ok(url_val) = url_check {
                 let url = url_val.as_str().unwrap_or("");
                 if url.contains("/search") || url.contains("q=") {
-                    debug!("Session {} search submitted (attempt {}, url: {})", session.id, attempt + 1, &url[..url.len().min(80)]);
+                    debug!("Session {} search submitted (attempt {}, url: {})", session.id, attempt + 1, safe_truncate(url, 80));
                     search_submitted = true;
                     // Wait a bit more for results to render
                     tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -1046,7 +1047,7 @@ impl BrowserActions {
         let has_no_results = page_info.get("hasNoResults").and_then(|v| v.as_bool()).unwrap_or(false);
 
         info!("Session {} search page: url={}, title={}",
-            session.id, &url[..url.len().min(100)], &title[..title.len().min(50)]);
+            session.id, safe_truncate(url, 100), safe_truncate(title, 50));
         info!("Session {} search results: {} organic, {} top ads, {} grintahub links, captcha={}, noResults={}",
             session.id, result_count, top_ad_count, grinta_count, has_captcha, has_no_results);
 
@@ -1728,7 +1729,7 @@ impl BrowserActions {
         info!("Session {} starting warm-up phase (build trust before searching)", session.id);
 
         // Phase 1: Visit Google first to get NID/CONSENT cookies
-        session.navigate("https://www.google.com.sa/").await?;
+        session.navigate("https://www.google.com.sa/?hl=ar&gl=sa").await?;
         Self::human_delay(2500, 1500).await;
 
         // Handle consent dialog (reuses the same consent handling as goto_google)
@@ -1811,7 +1812,7 @@ impl BrowserActions {
         info!("Session {} organic search: \"{}\"", session.id, query);
 
         // Navigate to Google (consent already handled during warm-up)
-        session.navigate("https://www.google.com.sa/").await?;
+        session.navigate("https://www.google.com.sa/?hl=ar&gl=sa").await?;
         Self::human_delay(1500, 1000).await;
 
         // Do the search using existing google_search flow
