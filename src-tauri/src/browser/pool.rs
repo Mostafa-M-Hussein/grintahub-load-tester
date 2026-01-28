@@ -56,6 +56,8 @@ pub struct BrowserPool {
     /// Runtime captcha extension dir override — set when bot starts so all
     /// sessions load the 2Captcha solver extension.
     captcha_extension_override: RwLock<Option<String>>,
+    /// Lock to prevent concurrent session spawning (prevents race between bot.rs and supervisor)
+    spawn_lock: tokio::sync::Mutex<()>,
 }
 
 impl BrowserPool {
@@ -69,6 +71,7 @@ impl BrowserPool {
             used_ips: Arc::new(RwLock::new(HashSet::new())),
             headless_override: RwLock::new(None),
             captcha_extension_override: RwLock::new(None),
+            spawn_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -102,9 +105,15 @@ impl BrowserPool {
     /// Each session gets a unique proxy URL to ensure different IPs.
     /// All sessions launch simultaneously for maximum speed.
     /// Optionally override headless mode.
+    ///
+    /// Uses a spawn_lock to prevent race conditions between bot.rs and supervisor
+    /// both trying to spawn sessions at the same time.
     pub async fn spawn_sessions_with_options(&self, count: usize, headless: Option<bool>) -> Result<Vec<String>, BrowserError> {
         use std::time::Duration;
         use futures::future::join_all;
+
+        // Acquire spawn lock to prevent concurrent spawning (bot.rs vs supervisor race)
+        let _spawn_guard = self.spawn_lock.lock().await;
 
         let headless_mode = match headless {
             Some(h) => h,
