@@ -435,6 +435,33 @@ impl BrowserSession {
                 info!("Session {} using direct proxy: {}", session_id, chrome_proxy);
                 builder = builder.arg(("proxy-server", chrome_proxy.as_str()));
             }
+
+            // Bypass proxy for non-essential Google services that Oxylabs blocks/throttles
+            // These cause 403 (restricted target) and 522 (timeout) errors
+            // They are background Chrome services not needed for search/ad clicking
+            builder = builder.arg(("proxy-bypass-list",
+                "mtalk.google.com;\
+                 alt1-mtalk.google.com;\
+                 alt2-mtalk.google.com;\
+                 alt3-mtalk.google.com;\
+                 alt4-mtalk.google.com;\
+                 alt5-mtalk.google.com;\
+                 alt6-mtalk.google.com;\
+                 alt7-mtalk.google.com;\
+                 alt8-mtalk.google.com;\
+                 optimizationguide-pa.googleapis.com;\
+                 content-autofill.googleapis.com;\
+                 clientservices.googleapis.com;\
+                 update.googleapis.com;\
+                 safebrowsing.googleapis.com;\
+                 accounts.google.com;\
+                 clients1.google.com;\
+                 clients2.google.com;\
+                 clients3.google.com;\
+                 clients4.google.com;\
+                 clients5.google.com;\
+                 clients6.google.com"
+            ));
         }
 
         // Set window size
@@ -1082,11 +1109,14 @@ impl BrowserSession {
             }
         }
 
-        // Close browser
+        // Close browser - try graceful close first, then force kill
         {
             let mut browser = self.browser.write().await;
             if let Some(mut b) = browser.take() {
+                // Try graceful close first
                 let _ = b.close().await;
+                // Force kill to ensure all Chrome processes are terminated (fixes Windows zombie issue)
+                let _ = b.kill().await;
             }
         }
 
@@ -1503,6 +1533,19 @@ impl BrowserSession {
             "*.casalemedia.com/*".to_string(),
             "*.amazon-adsystem.com/*".to_string(),
             "*.adnxs.com/*".to_string(),
+            // Chrome background services (cause proxy 403/522 errors on Oxylabs)
+            "*mtalk.google.com*".to_string(),
+            "*optimizationguide-pa.googleapis.com*".to_string(),
+            "*content-autofill.googleapis.com*".to_string(),
+            "*clientservices.googleapis.com*".to_string(),
+            "*update.googleapis.com*".to_string(),
+            "*safebrowsing.googleapis.com*".to_string(),
+            "*clients1.google.com*".to_string(),
+            "*clients2.google.com*".to_string(),
+            "*clients3.google.com*".to_string(),
+            "*clients4.google.com*".to_string(),
+            "*clients5.google.com*".to_string(),
+            "*clients6.google.com*".to_string(),
             // Video embeds (heavy bandwidth)
             "*.youtube.com/embed/*".to_string(),
             "*.vimeo.com/*".to_string(),
