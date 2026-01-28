@@ -81,6 +81,7 @@ impl SessionSupervisor {
                 let auto_rotate_ip = config.auto_rotate_ip;
                 let captcha_api_key = config.captcha_api_key.clone();
                 let headless = config.headless;
+                let target_domains = config.target_domains.clone();
 
                 // Extract Google account
                 let google_account: Option<crate::browser::GoogleAccount> = config.accounts
@@ -130,6 +131,7 @@ impl SessionSupervisor {
                                     google_account.clone(),
                                     auto_rotate_ip,
                                     captcha_api_key.clone(),
+                                    target_domains.clone(),
                                 );
                             }
                         }

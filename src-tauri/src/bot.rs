@@ -163,8 +163,9 @@ pub async fn start_bot_logic(state: &AppState) -> Result<(), String> {
     let max_clicks = config.max_clicks_per_session;
     let auto_rotate_ip = config.auto_rotate_ip;
     let captcha_api_key = config.captcha_api_key.clone();
+    let target_domains = config.target_domains.clone();
 
-    info!("Bot loop started with {} sessions (auto_rotate_ip: {})", session_ids.len(), auto_rotate_ip);
+    info!("Bot loop started with {} sessions (auto_rotate_ip: {}, targets: {:?})", session_ids.len(), auto_rotate_ip, target_domains);
 
     for session_id in session_ids {
         spawn_session_task_safe(
@@ -178,6 +179,7 @@ pub async fn start_bot_logic(state: &AppState) -> Result<(), String> {
             google_account.clone(),
             auto_rotate_ip,
             captcha_api_key.clone(),
+            target_domains.clone(),
         );
     }
 
@@ -778,6 +780,7 @@ pub fn spawn_session_task_safe(
     google_account: Option<GoogleAccount>,
     auto_rotate_ip: bool,
     captcha_api_key: String,
+    target_domains: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
     let pool_cleanup = pool.clone();
     let stats_cleanup = stats.clone();
@@ -788,7 +791,7 @@ pub fn spawn_session_task_safe(
             run_session_loop(
                 session_id, pool, stats, rate_config,
                 is_running, keywords, max_clicks, google_account,
-                auto_rotate_ip, captcha_api_key,
+                auto_rotate_ip, captcha_api_key, target_domains,
             )
         );
 
@@ -833,6 +836,7 @@ async fn run_session_loop(
     google_account: Option<GoogleAccount>,
     auto_rotate_ip: bool,
     captcha_api_key: String,
+    target_domains: Vec<String>,
 ) {
     info!("Session {} bot loop starting (max_clicks: {}, google_login: {}, auto_rotate_ip: {})",
         session_id,
@@ -889,6 +893,7 @@ async fn run_session_loop(
             google_account.as_ref(),
             &mut already_logged_in,
             Some(&stats), // Pass stats so click is counted IMMEDIATELY when redirect confirmed
+            &target_domains,
         ).await {
             Ok(clicked) => {
                 // Click already counted inside run_cycle when redirect confirmed

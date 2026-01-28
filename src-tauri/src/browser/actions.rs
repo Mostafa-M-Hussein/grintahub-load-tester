@@ -1102,120 +1102,139 @@ impl BrowserActions {
         Ok(result_count > 0)
     }
 
-    /// Helper function to scan for grintahub ads on the page
-    /// Find grintahub ad AND click it in a single JS execution.
+    /// Helper function to scan for target domain ads on the page
+    /// Find target ad AND click it in a single JS execution.
     /// Returns { clicked: bool, count: int, type: str, debug: {} }
     /// This avoids the DOM-state-change bug where scan finds ads but a separate click call can't.
-    async fn find_and_click_grintahub_ad(session: &Arc<BrowserSession>) -> Result<serde_json::Value, BrowserError> {
-        session.execute_js(r#"
-            (async function() {
+    async fn find_and_click_target_ad(session: &Arc<BrowserSession>, targets: &[String]) -> Result<serde_json::Value, BrowserError> {
+        // Build JS array of target domains and their simplified forms
+        let targets_js = targets.iter()
+            .map(|d| {
+                // For each target, create both full domain and simplified forms
+                // e.g., "grintahub.com" -> ["grintahub.com", "grintahub"]
+                // e.g., "golden4tic.com" -> ["golden4tic.com", "golden4tic"]
+                let simple = d.replace(".com", "").replace(".net", "").replace(".org", "");
+                format!("'{}', '{}'", d.replace("'", "\\'"), simple.replace("'", "\\'"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let js_code = format!(r#"
+            (async function() {{
+                // Target domains to look for (dynamically injected)
+                const targets = [{targets_js}];
+                const matchesTarget = (str) => {{
+                    const s = (str || '').toLowerCase();
+                    return targets.some(t => s.includes(t.toLowerCase()));
+                }};
+
                 // Clean up any previous ad target markers
                 document.querySelectorAll('[data-grinta-ad-target]').forEach(el => el.removeAttribute('data-grinta-ad-target'));
 
-                // ===== Step 1: Find ALL grintahub links on the page =====
-                // Pass 1: Links with "grintahub" directly in href (organic results)
-                const allGrintaLinks = [];
+                // ===== Step 1: Find ALL target domain links on the page =====
+                // Pass 1: Links with target domain directly in href (organic results)
+                const allTargetLinks = [];
                 const seen = new Set(); // track by element reference
                 const allLinks = document.querySelectorAll('a[href]');
-                for (const link of allLinks) {
+                for (const link of allLinks) {{
                     const href = link.getAttribute('href') || '';
-                    if ((href.includes('grintahub.com') || href.includes('grintahub')) &&
-                        !href.includes('google.com') && !href.includes('google.co')) {
-                        allGrintaLinks.push(link);
+                    if (matchesTarget(href) && !href.includes('google.com') && !href.includes('google.co')) {{
+                        allTargetLinks.push(link);
                         seen.add(link);
-                    }
-                }
+                    }}
+                }}
 
-                // Pass 2: Google Ad links that REDIRECT to grintahub
+                // Pass 2: Google Ad links that REDIRECT to target domain
                 // Ad links use googleadservices.com/pagead/aclk?... as href
-                // The "grintahub.com" text is in a sibling <cite> or display URL element
-                // We find ad blocks that mention "grintahub" and collect ALL their links
+                // The target domain text is in a sibling <cite> or display URL element
+                // We find ad blocks that mention target domain and collect ALL their links
                 const adContainers = document.querySelectorAll('#tads, #tadsb, #bottomads');
                 let pass2Count = 0;
-                for (const container of adContainers) {
+                for (const container of adContainers) {{
                     // Find individual ad blocks within the container
                     // Each ad is typically a div with data-dtld or data-text-ad, or a direct child block
                     const adBlocks = container.querySelectorAll('[data-dtld], [data-text-ad], .uEierd, .x54gtf');
                     const blocksToCheck = adBlocks.length > 0 ? adBlocks : [container];
-                    for (const block of blocksToCheck) {
-                        // Check if this ad block is for grintahub
+                    for (const block of blocksToCheck) {{
+                        // Check if this ad block is for target domain
                         const dtld = block.getAttribute('data-dtld') || '';
                         const blockText = (block.innerText || '').toLowerCase();
                         const citeEls = block.querySelectorAll('cite, .qzEoUe, .NJjxre, [data-dtld]');
-                        let mentionsGrinta = dtld.includes('grintahub');
-                        if (!mentionsGrinta) {
-                            for (const cite of citeEls) {
-                                if ((cite.textContent || '').toLowerCase().includes('grintahub')) {
-                                    mentionsGrinta = true;
+                        let mentionsTarget = matchesTarget(dtld);
+                        if (!mentionsTarget) {{
+                            for (const cite of citeEls) {{
+                                if (matchesTarget(cite.textContent)) {{
+                                    mentionsTarget = true;
                                     break;
-                                }
-                            }
-                        }
-                        if (!mentionsGrinta) {
-                            mentionsGrinta = blockText.includes('grintahub');
-                        }
+                                }}
+                            }}
+                        }}
+                        if (!mentionsTarget) {{
+                            mentionsTarget = matchesTarget(blockText);
+                        }}
 
-                        if (mentionsGrinta) {
-                            // This ad block is for grintahub — collect ALL its <a> links
+                        if (mentionsTarget) {{
+                            // This ad block is for target domain — collect ALL its <a> links
                             const blockLinks = block.querySelectorAll('a[href]');
-                            for (const link of blockLinks) {
-                                if (!seen.has(link)) {
-                                    allGrintaLinks.push(link);
+                            for (const link of blockLinks) {{
+                                if (!seen.has(link)) {{
+                                    allTargetLinks.push(link);
                                     seen.add(link);
                                     pass2Count++;
-                                }
-                            }
-                        }
-                    }
-                }
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
 
-                if (allGrintaLinks.length === 0) {
-                    return { clicked: false, count: 0, debug: {
-                        reason: 'no_grintahub_links_on_page',
+                if (allTargetLinks.length === 0) {{
+                    return {{ clicked: false, count: 0, debug: {{
+                        reason: 'no_target_links_on_page',
+                        targets: targets,
                         hasTopAds: !!document.querySelector('#tads'),
                         hasBottomAds: !!document.querySelector('#tadsb, #bottomads'),
                         adContainerCount: adContainers.length
-                    }};
-                }
+                    }}}};
+                }}
 
                 // ===== Step 2: Classify each link as AD or ORGANIC =====
                 const adLinks = [];
                 const organicLinks = [];
 
-                for (const link of allGrintaLinks) {
+                for (const link of allTargetLinks) {{
                     const href = link.getAttribute('href') || '';
                     let isAd = false;
                     let adType = 'organic';
 
                     // Check 1: href contains googleadservices or aclk (definite ad click tracking)
-                    if (href.includes('googleadservices.com') || href.includes('/aclk?') || href.includes('?aclk')) {
+                    if (href.includes('googleadservices.com') || href.includes('/aclk?') || href.includes('?aclk')) {{
                         isAd = true;
                         adType = 'adservice';
-                    }
+                    }}
 
                     // Check 2: link is inside #tads or #tadsb (Google ad containers)
-                    if (!isAd && (link.closest('#tads') || link.closest('#tadsb') || link.closest('#bottomads'))) {
+                    if (!isAd && (link.closest('#tads') || link.closest('#tadsb') || link.closest('#bottomads'))) {{
                         isAd = true;
                         adType = 'tads_container';
-                    }
+                    }}
 
                     // Check 3: link is inside an element with data-text-ad
-                    if (!isAd && link.closest('[data-text-ad]')) {
+                    if (!isAd && link.closest('[data-text-ad]')) {{
                         isAd = true;
                         adType = 'text_ad_attr';
-                    }
+                    }}
 
                     // Check 4: link is inside data-dtld container (Google ad data attribute)
-                    if (!isAd && link.closest('[data-dtld]')) {
+                    if (!isAd && link.closest('[data-dtld]')) {{
                         isAd = true;
                         adType = 'data_dtld';
-                    }
+                    }}
 
                     // Check 5: Walk UP from the link looking for ad label text
                     // Arabic Google shows "نتيجة إعلانية" (Advertising result) as the ad label
-                    if (!isAd) {
+                    if (!isAd) {{
                         let ancestor = link.parentElement;
-                        for (let i = 0; i < 12 && ancestor && ancestor !== document.body; i++) {
+                        for (let i = 0; i < 12 && ancestor && ancestor !== document.body; i++) {{
                             const txt = ancestor.innerText || '';
                             const txtLower = txt.toLowerCase();
                             if (txt.includes('نتيجة إعلانية') ||
@@ -1225,39 +1244,39 @@ impl BrowserActions {
                                 txt.includes('مُموَّل') ||
                                 txtLower.includes('sponsored') ||
                                 txtLower.includes('ad ·') ||
-                                txtLower.includes('· ad')) {
+                                txtLower.includes('· ad')) {{
                                 // Make sure this is an ad block, not the whole page
-                                if (ancestor.offsetHeight < 800 && ancestor.offsetHeight > 20) {
+                                if (ancestor.offsetHeight < 800 && ancestor.offsetHeight > 20) {{
                                     isAd = true;
                                     adType = 'text_label';
                                     break;
-                                }
-                            }
+                                }}
+                            }}
                             // Also check aria-label
                             const ariaLabel = ancestor.getAttribute('aria-label') || '';
                             if (ariaLabel.includes('Sponsored') || ariaLabel.includes('إعلان') ||
                                 ariaLabel.includes('ممول') || ariaLabel.includes('إعلانية') ||
-                                ariaLabel.includes('نتيجة إعلانية')) {
+                                ariaLabel.includes('نتيجة إعلانية')) {{
                                 isAd = true;
                                 adType = 'aria_label';
                                 break;
-                            }
+                            }}
                             ancestor = ancestor.parentElement;
-                        }
-                    }
+                        }}
+                    }}
 
                     // Check 6: Known ad CSS classes
-                    if (!isAd) {
+                    if (!isAd) {{
                         const el = link.closest('.uEierd, .x54gtf, .d5oMvf, .nMdasd, .ads-ad, .commercial-unit-desktop-top, [data-sokoban-container], .cu-container, .pla-unit');
-                        if (el) {
+                        if (el) {{
                             isAd = true;
                             adType = 'css_class';
-                        }
-                    }
+                        }}
+                    }}
 
                     const linkText = (link.innerText || link.textContent || '').trim();
                     const rect = link.getBoundingClientRect();
-                    const entry = {
+                    const entry = {{
                         el: link,
                         href: href,
                         text: linkText.substring(0, 100),
@@ -1265,14 +1284,14 @@ impl BrowserActions {
                         y: rect.top,
                         isSitelink: linkText.length > 0 && linkText.length <= 40,
                         visible: rect.width > 0 && rect.height > 0 && rect.top > -100 && rect.top < window.innerHeight + 100
-                    };
+                    }};
 
-                    if (isAd) {
+                    if (isAd) {{
                         adLinks.push(entry);
-                    } else {
+                    }} else {{
                         organicLinks.push(entry);
-                    }
-                }
+                    }}
+                }}
 
                 // ===== Step 3: Choose the best link to click =====
                 // Priority: visible ad sitelink > visible ad link > organic fallback
@@ -1280,25 +1299,25 @@ impl BrowserActions {
 
                 const visibleAdLinks = adLinks.filter(l => l.visible && l.text.length > 0);
 
-                if (visibleAdLinks.length > 0) {
+                if (visibleAdLinks.length > 0) {{
                     // Prefer sitelinks (shorter text = specific landing pages)
                     const sitelinks = visibleAdLinks.filter(l => l.isSitelink);
-                    if (sitelinks.length > 0) {
+                    if (sitelinks.length > 0) {{
                         chosen = sitelinks[Math.floor(Math.random() * sitelinks.length)];
                         chosen.type = chosen.type + '_sitelink';
-                    } else {
+                    }} else {{
                         chosen = visibleAdLinks[0];
-                    }
-                } else if (adLinks.length > 0) {
+                    }}
+                }} else if (adLinks.length > 0) {{
                     chosen = adLinks[0]; // Not visible but still an ad
-                }
+                }}
 
                 // NO organic fallback — only click actual Google Ads campaign links
                 // If no ad found, return false so bot rotates IP
 
                 const bodyText = document.body ? document.body.innerText : '';
-                const debug = {
-                    totalGrintaLinks: allGrintaLinks.length,
+                const debug = {{
+                    totalTargetLinks: allTargetLinks.length,
                     adLinksFound: adLinks.length,
                     organicLinksFound: organicLinks.length,
                     adRedirectLinks: pass2Count,
@@ -1306,12 +1325,13 @@ impl BrowserActions {
                     hasBottomAds: !!document.querySelector('#tadsb, #bottomads'),
                     pageHasAdLabel: bodyText.includes('نتيجة إعلانية') || bodyText.includes('إعلان') || bodyText.includes('Sponsored'),
                     adTypes: adLinks.map(l => l.type + ':' + l.text.substring(0, 30)).join(' | '),
-                    scrollY: window.scrollY
-                };
+                    scrollY: window.scrollY,
+                    targets: targets
+                }};
 
-                if (!chosen) {
-                    return { clicked: false, count: 0, debug };
-                }
+                if (!chosen) {{
+                    return {{ clicked: false, count: 0, debug }};
+                }}
 
                 // ===== Step 4: Prepare chosen link for CDP click =====
                 // Mark this element so fallback JS can re-find it
@@ -1320,17 +1340,17 @@ impl BrowserActions {
                 chosen.el.setAttribute('target', '_self');
 
                 // Scroll into view (instant, not smooth — avoid timing issues)
-                chosen.el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                chosen.el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
                 await new Promise(r => setTimeout(r, 300));
 
                 // Validate coordinates are within viewport
                 let finalRect = chosen.el.getBoundingClientRect();
-                if (finalRect.top < 0 || finalRect.bottom > window.innerHeight) {
+                if (finalRect.top < 0 || finalRect.bottom > window.innerHeight) {{
                     // Re-scroll if element not in viewport
-                    chosen.el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    chosen.el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
                     await new Promise(r => setTimeout(r, 200));
                     finalRect = chosen.el.getBoundingClientRect();
-                }
+                }}
 
                 // Randomized click position within the link (humans don't click exact center)
                 // Use gaussian-like distribution: mostly near center but with natural variance
@@ -1341,7 +1361,7 @@ impl BrowserActions {
                 const clickX = Math.min(Math.max(rawX, 10), window.innerWidth - 10);
                 const clickY = Math.min(Math.max(rawY, 10), vpH - 10);
 
-                return {
+                return {{
                     clicked: false,
                     ready_for_cdp_click: true,
                     count: adLinks.length,
@@ -1352,9 +1372,10 @@ impl BrowserActions {
                     x: clickX,
                     y: clickY,
                     debug
-                };
-            })()
-        "#).await
+                }};
+            }})()
+        "#, targets_js = targets_js);
+        session.execute_js(&js_code).await
     }
 
     /// Perform click on an ad using MULTIPLE methods until one works.
@@ -1373,7 +1394,7 @@ impl BrowserActions {
         let href = result.get("href").and_then(|v| v.as_str()).unwrap_or("");
         let text = result.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
-        info!("Session {} clicking grintahub ad {} ({} found, type: {}, text: '{}')",
+        info!("Session {} clicking target ad {} ({} found, type: {}, text: '{}')",
             session.id, phase, count, ad_type, safe_truncate(text, 60));
 
         // Record URL before click
@@ -1682,12 +1703,12 @@ impl BrowserActions {
         Ok(false)
     }
 
-    /// Find and click on grintahub.com CAMPAIGN AD in Google results.
-    /// Scans the page for grintahub ads (using "نتيجة إعلانية", "إعلان", sitelinks, #tads, etc.)
+    /// Find and click on target domain CAMPAIGN AD in Google results.
+    /// Scans the page for target ads (using "نتيجة إعلانية", "إعلان", sitelinks, #tads, etc.)
     /// Only clicks actual Google Ads — never organic results.
     /// After clicking, verifies navigation actually happened (CDP → JS click → direct nav).
-    pub async fn click_grintahub_result(session: &Arc<BrowserSession>) -> Result<bool, BrowserError> {
-        info!("Session {} looking for grintahub.com CAMPAIGN ADS", session.id);
+    pub async fn click_target_ad(session: &Arc<BrowserSession>, targets: &[String]) -> Result<bool, BrowserError> {
+        info!("Session {} looking for CAMPAIGN ADS for targets: {:?}", session.id, targets);
 
         // Brief pause to "read" results like a human
         Self::random_delay(800, 1200).await;
@@ -1704,17 +1725,17 @@ impl BrowserActions {
         }
 
         // ========== PHASE 1: Scan from top of page ==========
-        let result = Self::find_and_click_grintahub_ad(session).await?;
+        let result = Self::find_and_click_target_ad(session, targets).await?;
         let debug_info = result.get("debug").cloned().unwrap_or_default();
         let ad_count = debug_info.get("adLinksFound").and_then(|v| v.as_u64()).unwrap_or(0);
         let organic_count = debug_info.get("organicLinksFound").and_then(|v| v.as_u64()).unwrap_or(0);
-        let total_grinta = debug_info.get("totalGrintaLinks").and_then(|v| v.as_u64()).unwrap_or(0);
+        let total_target = debug_info.get("totalTargetLinks").and_then(|v| v.as_u64()).unwrap_or(0);
         let redirect_count = debug_info.get("adRedirectLinks").and_then(|v| v.as_u64()).unwrap_or(0);
         let has_ad_label = debug_info.get("pageHasAdLabel").and_then(|v| v.as_bool()).unwrap_or(false);
         let ad_types = debug_info.get("adTypes").and_then(|v| v.as_str()).unwrap_or("");
 
-        info!("Session {} scan: {} grintahub links ({} ads [{}via redirect], {} organic), adLabel={}, types=[{}]",
-            session.id, total_grinta, ad_count, redirect_count, organic_count, has_ad_label, safe_truncate(ad_types, 100));
+        info!("Session {} scan: {} target links ({} ads [{}via redirect], {} organic), adLabel={}, types=[{}]",
+            session.id, total_target, ad_count, redirect_count, organic_count, has_ad_label, safe_truncate(ad_types, 100));
 
         if Self::cdp_click_ad(session, &result, "initial scan").await? {
             return Ok(true);
@@ -1729,7 +1750,7 @@ impl BrowserActions {
             )).await?;
             Self::random_delay(600, 900).await;
 
-            let result = Self::find_and_click_grintahub_ad(session).await?;
+            let result = Self::find_and_click_target_ad(session, targets).await?;
             if Self::cdp_click_ad(session, &result, &format!("scroll {}", step + 1)).await? {
                 return Ok(true);
             }
@@ -1741,7 +1762,7 @@ impl BrowserActions {
         "#).await?;
         Self::random_delay(700, 1000).await;
 
-        let result = Self::find_and_click_grintahub_ad(session).await?;
+        let result = Self::find_and_click_target_ad(session, targets).await?;
         if Self::cdp_click_ad(session, &result, "bottom").await? {
             return Ok(true);
         }
@@ -1750,13 +1771,13 @@ impl BrowserActions {
         session.execute_js("window.scrollTo({ top: 0, behavior: 'smooth' })").await?;
         Self::random_delay(500, 800).await;
 
-        let result = Self::find_and_click_grintahub_ad(session).await?;
+        let result = Self::find_and_click_target_ad(session, targets).await?;
         if Self::cdp_click_ad(session, &result, "final").await? {
             return Ok(true);
         }
 
-        warn!("Session {} NO grintahub CAMPAIGN ADS found (ads={}, organic_skipped={}, total={})",
-            session.id, ad_count, organic_count, total_grinta);
+        warn!("Session {} NO CAMPAIGN ADS found for targets {:?} (ads={}, organic_skipped={}, total={})",
+            session.id, targets, ad_count, organic_count, total_target);
         Ok(false)
     }
 
@@ -1812,18 +1833,18 @@ impl BrowserActions {
         Ok(false)
     }
 
-    /// Browse the grintahub page after clicking from Google
+    /// Browse the target page after clicking from Google
     /// Uses enhanced human-like reading behavior
-    pub async fn browse_grintahub_page(session: &Arc<BrowserSession>) -> Result<(), BrowserError> {
-        debug!("Session {} browsing grintahub page with human-like behavior", session.id);
+    pub async fn browse_target_page(session: &Arc<BrowserSession>) -> Result<(), BrowserError> {
+        debug!("Session {} browsing target page with human-like behavior", session.id);
 
-        // Verify we're on grintahub.com
-        let on_grintahub = session.execute_js(r#"
-            window.location.hostname.includes('grintahub')
+        // Verify we're not on Google anymore (we've navigated to the ad target)
+        let on_google = session.execute_js(r#"
+            window.location.hostname.includes('google')
         "#).await?;
 
-        if on_grintahub.as_bool() != Some(true) {
-            warn!("Session {} not on grintahub.com", session.id);
+        if on_google.as_bool() == Some(true) {
+            warn!("Session {} still on Google, not on target page", session.id);
             return Ok(());
         }
 
@@ -2045,8 +2066,15 @@ impl BrowserActions {
         min_delay_ms: u64,
         max_delay_ms: u64,
         stats: Option<&Arc<crate::stats::GlobalStats>>,
+        target_domains: &[String],
     ) -> Result<bool, BrowserError> {
-        info!("Session {} starting Google search cycle for: {} (with enhanced stealth)", session.id, keyword);
+        // Use default if empty
+        let targets: Vec<String> = if target_domains.is_empty() {
+            vec!["grintahub.com".to_string()]
+        } else {
+            target_domains.to_vec()
+        };
+        info!("Session {} starting Google search cycle for: {} (targets: {:?})", session.id, keyword, targets);
 
         // 1. Go to Google with human-like behavior
         Self::goto_google(session).await?;
@@ -2068,42 +2096,54 @@ impl BrowserActions {
         // Decision pause — human decides which result to click
         Self::human_delay(600, 400).await;
 
-        // 3. Try to find and click grintahub.com SPONSORED AD - FIRST PAGE ONLY
-        let clicked = Self::click_grintahub_result(session).await?;
+        // 3. Try to find and click target domain SPONSORED AD - FIRST PAGE ONLY
+        let clicked = Self::click_target_ad(session, &targets).await?;
 
         if clicked {
-            // Wait for the redirect to complete and verify we landed on grintahub
-            info!("Session {} ad clicked - waiting for redirect to grintahub.com...", session.id);
+            // Wait for the redirect to complete and verify we landed on target domain
+            info!("Session {} ad clicked - waiting for redirect to target domain...", session.id);
+
+            // Build JS array of target domains for checking
+            let targets_js = targets.iter()
+                .map(|d| format!("'{}'", d.replace("'", "\\'")))
+                .collect::<Vec<_>>()
+                .join(",");
 
             // Wait for page load (check document.readyState and URL)
-            let mut landed_on_grinta = false;
+            let mut landed_on_target = false;
             for attempt in 0..10 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                let page_state = session.execute_js(r#"
-                    (function() {
-                        return {
+                let check_js = format!(r#"
+                    (function() {{
+                        const targets = [{}];
+                        const hostname = window.location.hostname.toLowerCase();
+                        const onTarget = targets.some(t => hostname.includes(t.replace('.com', '').replace('.', '')));
+                        return {{
                             url: window.location.href,
                             ready: document.readyState,
-                            onGrinta: window.location.hostname.includes('grintahub')
-                        };
-                    })()
-                "#).await;
+                            onTarget: onTarget,
+                            hostname: hostname
+                        }};
+                    }})()
+                "#, targets_js);
+                let page_state = session.execute_js(&check_js).await;
 
                 match page_state {
                     Ok(state) => {
-                        let on_grinta = state.get("onGrinta").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let on_target = state.get("onTarget").and_then(|v| v.as_bool()).unwrap_or(false);
                         let ready = state.get("ready").and_then(|v| v.as_str()).unwrap_or("loading");
-                        if on_grinta {
-                            landed_on_grinta = true;
+                        let hostname = state.get("hostname").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        if on_target {
+                            landed_on_target = true;
                             // *** CLICK COUNTED HERE *** - immediately when redirect confirmed
                             session.increment_clicks();
                             if let Some(s) = stats {
                                 s.record_click(0); // Latency will be updated by caller if needed
                             }
-                            info!("Session {} AD CLICK SUCCESS - landed on grintahub.com (attempt {}) [CLICK COUNTED]", session.id, attempt + 1);
+                            info!("Session {} AD CLICK SUCCESS - landed on {} (attempt {}) [CLICK COUNTED]", session.id, hostname, attempt + 1);
                             break;
                         }
-                        debug!("Session {} page state: ready={}, onGrinta={} (attempt {})", session.id, ready, on_grinta, attempt + 1);
+                        debug!("Session {} page state: ready={}, onTarget={}, host={} (attempt {})", session.id, ready, on_target, hostname, attempt + 1);
                     }
                     Err(_) => {
                         // Context may be destroyed during navigation - wait more
@@ -2113,7 +2153,7 @@ impl BrowserActions {
             }
 
             // Click counted above when landing confirmed - dwell is just for anti-detection
-            if !landed_on_grinta {
+            if !landed_on_target {
                 // Still count it - the METHOD SUCCESS means click happened
                 session.increment_clicks();
                 if let Some(s) = stats {
@@ -2122,9 +2162,9 @@ impl BrowserActions {
                 warn!("Session {} click detected but didn't confirm landing - still counting as success [CLICK COUNTED]", session.id);
             }
 
-            // 4. Browse the grintahub page (non-fatal - click already counted above)
+            // 4. Browse the target page (non-fatal - click already counted above)
             let browse_start = std::time::Instant::now();
-            if let Err(e) = Self::browse_grintahub_page(session).await {
+            if let Err(e) = Self::browse_target_page(session).await {
                 warn!("Session {} browse error (click already counted): {}", session.id, e);
             }
             let browse_elapsed = browse_start.elapsed().as_millis() as u64;
@@ -2132,25 +2172,25 @@ impl BrowserActions {
             // 5. Brief dwell on landing page — anti-detection only, click already counted
             let min_dwell_ms: u64 = 10_000;
             let max_dwell_ms: u64 = 25_000;
-            let target_dwell = {
+            let dwell_time = {
                 let mut rng = rand::thread_rng();
                 rng.gen_range(min_dwell_ms..=max_dwell_ms)
             };
-            if browse_elapsed < target_dwell {
-                let remaining = target_dwell - browse_elapsed;
-                info!("Session {} dwell time: staying {}ms more on grintahub (browsed {}ms, target {}ms)",
-                    session.id, remaining, browse_elapsed, target_dwell);
+            if browse_elapsed < dwell_time {
+                let remaining = dwell_time - browse_elapsed;
+                info!("Session {} dwell time: staying {}ms more on target (browsed {}ms, target {}ms)",
+                    session.id, remaining, browse_elapsed, dwell_time);
                 tokio::time::sleep(Duration::from_millis(remaining)).await;
             }
 
             // Random delay before next cycle
             Self::human_delay(min_delay_ms, max_delay_ms - min_delay_ms).await;
 
-            info!("Session {} completed ad click cycle (dwell: {}ms)", session.id, target_dwell);
+            info!("Session {} completed ad click cycle (dwell: {}ms)", session.id, dwell_time);
             Ok(true)
         } else {
             // NO AD FOUND on first page = FAST IP change, no delay
-            info!("Session {} no grintahub.com SPONSORED AD found - fast IP change", session.id);
+            info!("Session {} no SPONSORED AD found for targets {:?} - fast IP change", session.id, targets);
             Err(BrowserError::ElementNotFound("No sponsored ad found - need new IP".into()))
         }
     }
@@ -2166,6 +2206,7 @@ impl BrowserActions {
         account: Option<&GoogleAccount>,
         already_logged_in: &mut bool,
         stats: Option<&Arc<crate::stats::GlobalStats>>,
+        target_domains: &[String],
     ) -> Result<bool, BrowserError> {
         // Login to Google if account provided and not already logged in
         if let Some(account) = account {
@@ -2202,7 +2243,7 @@ impl BrowserActions {
         }
 
         // Now run the regular cycle
-        Self::run_cycle(session, keyword, min_delay_ms, max_delay_ms, stats).await
+        Self::run_cycle(session, keyword, min_delay_ms, max_delay_ms, stats, target_domains).await
     }
 
     // =================== TRUST-BUILDING FUNCTIONS ===================

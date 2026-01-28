@@ -86,6 +86,16 @@ pub struct AppConfig {
     /// Auto-rotate IP after completing all keywords (restart session with new IP)
     #[serde(default)]
     pub auto_rotate_ip: bool,
+
+    /// Target domains to click ads for (e.g., ["grintahub.com", "golden4tic.com"])
+    /// Empty = default to grintahub.com only
+    #[serde(default = "default_target_domains")]
+    pub target_domains: Vec<String>,
+}
+
+/// Default target domains
+fn default_target_domains() -> Vec<String> {
+    vec!["grintahub.com".to_string()]
 }
 
 /// Default session time in minutes
@@ -116,6 +126,7 @@ impl Default for AppConfig {
             schedule: ScheduleConfig::default(),
             accounts: vec![],
             auto_rotate_ip: true,  // Rotate IP after completing all keywords
+            target_domains: default_target_domains(),
         }
     }
 }

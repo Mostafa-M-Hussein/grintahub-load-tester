@@ -246,9 +246,14 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
         }]
       : [];
 
+    // Ensure targetDomains has at least one value
+    const targetDomains = (localConfig.targetDomains && localConfig.targetDomains.length > 0)
+      ? localConfig.targetDomains
+      : ['grintahub.com'];
+
     // Save config with accounts
     try {
-      await onSave({ ...localConfig, keywords, accounts });
+      await onSave({ ...localConfig, keywords, accounts, targetDomains });
       setSaveStatus('saved');
 
       // Reset to idle after 2 seconds
@@ -540,6 +545,60 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
           <small className="form-hint">
             Each cycle rotates to the next keyword. After all keywords are used, it loops back.
           </small>
+        </div>
+      </fieldset>
+
+      <fieldset disabled={disabled}>
+        <legend>Target Websites</legend>
+        <div className="form-group">
+          <label style={{ marginBottom: '10px', display: 'block' }}>
+            Select which websites to click ads for:
+          </label>
+          <div className="target-domains-selector" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={localConfig.targetDomains?.includes('grintahub.com') ?? true}
+                onChange={e => {
+                  const current = localConfig.targetDomains || ['grintahub.com'];
+                  const newDomains = e.target.checked
+                    ? [...current.filter(d => d !== 'grintahub.com'), 'grintahub.com']
+                    : current.filter(d => d !== 'grintahub.com');
+                  // Ensure at least one domain is selected
+                  if (newDomains.length > 0) {
+                    handleChange('targetDomains', newDomains);
+                  }
+                }}
+              />
+              <span>grintahub.com</span>
+              <span style={{ color: '#888', fontSize: '0.85em' }}>(default)</span>
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={localConfig.targetDomains?.includes('golden4tic.com') ?? false}
+                onChange={e => {
+                  const current = localConfig.targetDomains || ['grintahub.com'];
+                  const newDomains = e.target.checked
+                    ? [...current.filter(d => d !== 'golden4tic.com'), 'golden4tic.com']
+                    : current.filter(d => d !== 'golden4tic.com');
+                  // Ensure at least one domain is selected
+                  if (newDomains.length > 0) {
+                    handleChange('targetDomains', newDomains);
+                  }
+                }}
+              />
+              <span>golden4tic.com</span>
+            </label>
+          </div>
+          <small className="form-hint" style={{ marginTop: '8px' }}>
+            The bot will click ads for selected websites. Select one or both.
+          </small>
+          {(localConfig.targetDomains?.length === 0 || !localConfig.targetDomains) && (
+            <div style={{ color: '#f66', marginTop: '5px', fontSize: '0.9em' }}>
+              At least one target must be selected
+            </div>
+          )}
         </div>
       </fieldset>
 
