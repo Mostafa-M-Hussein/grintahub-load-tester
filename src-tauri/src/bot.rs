@@ -7,8 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
-use rand::Rng;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, error};
 
 use crate::AppState;
 use crate::browser::{BrowserPool, BrowserActions, BrowserError, GoogleAccount};
@@ -835,7 +834,7 @@ async fn run_session_loop(
     max_clicks: u32,
     google_account: Option<GoogleAccount>,
     auto_rotate_ip: bool,
-    captcha_api_key: String,
+    _captcha_api_key: String,  // Reserved for future use
     target_domains: Vec<String>,
 ) {
     info!("Session {} bot loop starting (max_clicks: {}, google_login: {}, auto_rotate_ip: {})",
@@ -883,7 +882,7 @@ async fn run_session_loop(
         let keyword = &keywords[keyword_index % keywords.len()];
         keyword_index += 1;
 
-        let cycle_start = std::time::Instant::now();
+        let _cycle_start = std::time::Instant::now();  // Reserved for latency tracking
         let clicks_before = session.click_count();
         match BrowserActions::run_cycle_with_login(
             &session,
@@ -906,168 +905,28 @@ async fn run_session_loop(
                     consecutive_errors = 0;
                 }
 
-                if auto_rotate_ip && keyword_count > 0 && keyword_index % keyword_count == 0 && keyword_index > 0 {
-                    info!("Session {} completed {} keywords, rotating IP (#{}/{})",
-                        session_id, keyword_count, ip_rotation_count + 1, session.ip_change_count() + 1);
-
-                    let _ = pool.close_session(&session_id).await;
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-                    loop {
-                        if !is_running.load(Ordering::SeqCst) { break; }
-                        match pool.spawn_sessions(1).await {
-                            Ok(new_ids) if !new_ids.is_empty() => {
-                                let new_id = new_ids.into_iter().next().unwrap();
-                                ip_rotation_count += 1;
-                                info!("Session {} -> {} (auto-rotate #{})", session_id, new_id, ip_rotation_count);
-                                session_id = new_id;
-
-                                match pool.get_session(&session_id).await {
-                                    Some(s) => {
-                                        // Carry over click count to replacement session
-                                        for _ in 0..session_clicks { s.increment_clicks(); }
-                                        session = s;
-                                        already_logged_in = false;
-                                        tokio::time::sleep(Duration::from_millis(1000)).await;
-                                        break;
-                                    }
-                                    None => {
-                                        warn!("New session {} not found - retrying", session_id);
-                                        tokio::time::sleep(Duration::from_millis(2000)).await;
-                                    }
-                                }
-                            }
-                            _ => {
-                                warn!("Failed to spawn replacement - retrying in 3s");
-                                tokio::time::sleep(Duration::from_millis(3000)).await;
-                            }
-                        }
-                    }
-                }
             }
             Err(BrowserError::CaptchaDetected(msg)) => {
-                warn!("Session {} CAPTCHA detected: {} — rotating IP immediately (no solving)", session_id, msg);
+                warn!("Session {} CAPTCHA detected: {} — exiting for supervisor respawn", session_id, msg);
                 session.increment_captchas();
                 stats.record_error();
-                consecutive_errors += 1;
-
-                let _ = pool.close_session(&session_id).await;
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-
-                match pool.spawn_sessions(1).await {
-                    Ok(new_ids) if !new_ids.is_empty() => {
-                        let new_id = new_ids.into_iter().next().unwrap();
-                        info!("Session {} -> {} (CAPTCHA, IP change #{})",
-                            session_id, new_id, consecutive_errors);
-                        session_id = new_id;
-
-                        match pool.get_session(&session_id).await {
-                            Some(s) => {
-                                // Carry over click count to replacement session
-                                for _ in 0..session_clicks { s.increment_clicks(); }
-                                session = s;
-                                already_logged_in = false;
-                            }
-                            None => {
-                                warn!("New session {} not found - retrying spawn", session_id);
-                                tokio::time::sleep(Duration::from_millis(2000)).await;
-                                continue;
-                            }
-                        }
-                    }
-                    _ => {
-                        warn!("Failed to spawn replacement - retrying in 3s");
-                        tokio::time::sleep(Duration::from_millis(3000)).await;
-                        continue;
-                    }
-                }
+                // Exit loop - supervisor will spawn replacement
+                break;
             }
             Err(BrowserError::ElementNotFound(msg)) if msg.contains("need new IP") => {
-                warn!("Session {} no ad found: {} - changing IP", session_id, msg);
-                ip_rotation_count += 1;
-
-                let _ = pool.close_session(&session_id).await;
-                // Wait 3-8 seconds before spawning new session (reduces rapid cycling detection)
-                let no_ad_delay = 3000 + rand::thread_rng().gen_range(0..5000u64);
-                tokio::time::sleep(Duration::from_millis(no_ad_delay)).await;
-
-                loop {
-                    if !is_running.load(Ordering::SeqCst) { break; }
-                    match pool.spawn_sessions(1).await {
-                        Ok(new_ids) if !new_ids.is_empty() => {
-                            let new_id = new_ids.into_iter().next().unwrap();
-                            info!("Session {} -> {} (no ad, IP change #{})",
-                                session_id, new_id, ip_rotation_count);
-                            session_id = new_id;
-
-                            match pool.get_session(&session_id).await {
-                                Some(s) => {
-                                    // Carry over click count to replacement session
-                                    for _ in 0..session_clicks { s.increment_clicks(); }
-                                    session = s;
-                                    already_logged_in = false;
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    break;
-                                }
-                                None => {
-                                    warn!("New session {} not found - retrying", session_id);
-                                    tokio::time::sleep(Duration::from_millis(2000)).await;
-                                }
-                            }
-                        }
-                        _ => {
-                            warn!("Failed to spawn replacement - retrying in 3s");
-                            tokio::time::sleep(Duration::from_millis(3000)).await;
-                        }
-                    }
-                }
+                // No ad found for this keyword - just try the next keyword, don't exit
+                info!("Session {} no ad found for current keyword, trying next keyword", session_id);
+                // Continue to next iteration (keyword already incremented above)
+                continue;
             }
             Err(BrowserError::Timeout(msg)) |
             Err(BrowserError::NavigationFailed(msg)) |
             Err(BrowserError::ConnectionLost(msg)) => {
-                warn!("Session {} network error: {} - changing IP", session_id, msg);
+                warn!("Session {} network error: {} — exiting for supervisor respawn", session_id, msg);
                 stats.record_error();
                 session.increment_errors();
-                consecutive_errors += 1;
-
-                if consecutive_errors > 5 {
-                    let backoff = std::cmp::min(consecutive_errors as u64 * 1000, 30_000);
-                    warn!("Session {} network backoff {}ms ({} consecutive)", session_id, backoff, consecutive_errors);
-                    tokio::time::sleep(Duration::from_millis(backoff)).await;
-                }
-
-                let _ = pool.close_session(&session_id).await;
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-
-                loop {
-                    if !is_running.load(Ordering::SeqCst) { break; }
-                    match pool.spawn_sessions(1).await {
-                        Ok(new_ids) if !new_ids.is_empty() => {
-                            let new_id = new_ids.into_iter().next().unwrap();
-                            info!("Session {} -> {} (network error: {})", session_id, new_id, msg);
-                            session_id = new_id;
-
-                            match pool.get_session(&session_id).await {
-                                Some(s) => {
-                                    // Carry over click count to replacement session
-                                    for _ in 0..session_clicks { s.increment_clicks(); }
-                                    session = s;
-                                    already_logged_in = false;
-                                    tokio::time::sleep(Duration::from_millis(1000)).await;
-                                    break;
-                                }
-                                None => {
-                                    warn!("New session {} not found - retrying", session_id);
-                                    tokio::time::sleep(Duration::from_millis(2000)).await;
-                                }
-                            }
-                        }
-                        _ => {
-                            warn!("Failed to spawn replacement - retrying in 3s");
-                            tokio::time::sleep(Duration::from_millis(3000)).await;
-                        }
-                    }
-                }
+                // Exit loop - supervisor will spawn replacement
+                break;
             }
             Err(e) => {
                 warn!("Session {} cycle error: {}", session_id, e);
@@ -1077,35 +936,25 @@ async fn run_session_loop(
                 consecutive_errors += 1;
 
                 if !session.is_alive() {
-                    warn!("Session {} died - respawning", session_id);
-                    let _ = pool.close_session(&session_id).await;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    warn!("Session {} died — exiting for supervisor respawn", session_id);
+                    // Exit loop - supervisor will spawn replacement
+                    break;
+                }
 
-                    loop {
-                        if !is_running.load(Ordering::SeqCst) { break; }
-                        match pool.spawn_sessions(1).await {
-                            Ok(new_ids) if !new_ids.is_empty() => {
-                                let new_id = new_ids.into_iter().next().unwrap();
-                                info!("Session {} -> {} (respawned after error)", session_id, new_id);
-                                session_id = new_id;
-                                match pool.get_session(&session_id).await {
-                                    Some(s) => {
-                                        session = s;
-                                        already_logged_in = false;
-                                        break;
-                                    }
-                                    None => {
-                                        tokio::time::sleep(Duration::from_millis(2000)).await;
-                                    }
-                                }
-                            }
-                            _ => {
-                                tokio::time::sleep(Duration::from_millis(3000)).await;
-                            }
-                        }
-                    }
+                // Session still alive, continue with backoff
+                if consecutive_errors > 3 {
+                    let backoff = std::cmp::min(consecutive_errors as u64 * 1000, 10_000);
+                    warn!("Session {} error backoff {}ms", session_id, backoff);
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
                 }
             }
+        }
+
+        // Check if we completed a full keyword cycle - rotate IP regardless of success/failure
+        if auto_rotate_ip && keyword_count > 0 && keyword_index % keyword_count == 0 && keyword_index > 0 {
+            info!("Session {} completed {} keywords cycle — exiting for supervisor respawn with new IP",
+                session_id, keyword_count);
+            break;
         }
     }
 

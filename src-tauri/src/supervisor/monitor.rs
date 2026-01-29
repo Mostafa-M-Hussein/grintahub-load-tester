@@ -27,9 +27,9 @@ pub struct SupervisorConfig {
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            check_interval: Duration::from_secs(10),
-            initial_delay: Duration::from_secs(30),
-            max_recovery_batch: 3,
+            check_interval: Duration::from_secs(5),  // Check every 5s (sessions exit for respawn now)
+            initial_delay: Duration::from_secs(5),   // Reduced from 30s - sessions may exit early
+            max_recovery_batch: 5,                   // Allow more respawns per cycle
         }
     }
 }
@@ -117,6 +117,10 @@ impl SessionSupervisor {
                     match browser_pool.spawn_sessions_with_options(to_spawn, Some(headless)).await {
                         Ok(session_ids) => {
                             info!("[Supervisor] Spawned {} replacement sessions", session_ids.len());
+                            // Record IP changes (each new session = new IP)
+                            for _ in 0..session_ids.len() {
+                                global_stats.record_ip_change();
+                            }
 
                             // Start session loops for each replacement
                             for session_id in session_ids {

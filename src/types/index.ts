@@ -66,6 +66,7 @@ export interface GlobalStatsSnapshot {
   averageLatencyMs: number;
   clicksPerHour: number;
   activeSessions: number;
+  totalIpChanges: number;
 }
 
 export interface BotStatus {

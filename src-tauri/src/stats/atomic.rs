@@ -174,6 +174,7 @@ pub struct GlobalStats {
     pub total_errors: AtomicU64,
     pub total_latency_ms: AtomicU64,
     pub active_sessions: AtomicU64,
+    pub total_ip_changes: AtomicU64,
     pub start_time: AtomicU64,
 }
 
@@ -191,6 +192,7 @@ impl GlobalStats {
             total_errors: AtomicU64::new(0),
             total_latency_ms: AtomicU64::new(0),
             active_sessions: AtomicU64::new(0),
+            total_ip_changes: AtomicU64::new(0),
             start_time: AtomicU64::new(now),
         }
     }
@@ -211,6 +213,16 @@ impl GlobalStats {
     pub fn record_error(&self) {
         self.total_clicks.fetch_add(1, WRITE_ORDER);
         self.total_errors.fetch_add(1, WRITE_ORDER);
+    }
+
+    /// Record an IP change (session respawn)
+    pub fn record_ip_change(&self) {
+        self.total_ip_changes.fetch_add(1, WRITE_ORDER);
+    }
+
+    /// Get total IP changes
+    pub fn total_ip_changes(&self) -> u64 {
+        self.total_ip_changes.load(READ_ORDER)
     }
 
     /// Increment active sessions
@@ -303,6 +315,8 @@ impl GlobalStats {
         let elapsed_hours = now.saturating_sub(start) as f64 / 3600.0;
         let clicks_per_hour = if elapsed_hours < 0.001 { 0.0 } else { total_success as f64 / elapsed_hours };
 
+        let total_ip_changes = self.total_ip_changes.load(READ_ORDER);
+
         GlobalStatsSnapshot {
             total_clicks,
             total_success,
@@ -310,6 +324,7 @@ impl GlobalStats {
             average_latency_ms: avg_latency,
             clicks_per_hour,
             active_sessions,
+            total_ip_changes,
         }
     }
 
@@ -319,6 +334,7 @@ impl GlobalStats {
         self.total_success.store(0, WRITE_ORDER);
         self.total_errors.store(0, WRITE_ORDER);
         self.total_latency_ms.store(0, WRITE_ORDER);
+        self.total_ip_changes.store(0, WRITE_ORDER);
         // Don't reset active_sessions — that's managed separately
 
         let now = SystemTime::now()
@@ -339,4 +355,5 @@ pub struct GlobalStatsSnapshot {
     pub average_latency_ms: f64,
     pub clicks_per_hour: f64,
     pub active_sessions: u64,
+    pub total_ip_changes: u64,
 }

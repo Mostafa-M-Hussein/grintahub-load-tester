@@ -46,6 +46,7 @@ const DEFAULT_STATS: GlobalStatsSnapshot = {
   averageLatencyMs: 0,
   clicksPerHour: 0,
   activeSessions: 0,
+  totalIpChanges: 0,
 };
 
 const DEFAULT_BOT_STATUS: BotStatus = {
@@ -160,7 +161,8 @@ function App() {
     setError(null);
     try {
       await api.stopBot();
-      // Don't clear startTime immediately - keep showing final elapsed time
+      // Clear startTime so timer resets and config becomes editable
+      setStartTime(null);
     } catch (err) {
       setError(String(err));
     } finally {

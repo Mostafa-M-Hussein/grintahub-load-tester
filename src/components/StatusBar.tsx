@@ -56,7 +56,7 @@ export function StatusBar({ botStatus, stats, scheduleStatus, startTime }: Statu
     error: null,
   });
 
-  // Update elapsed time every second when running
+  // Update elapsed time every second ONLY when running
   useEffect(() => {
     if (!startTime) {
       setElapsedTime('00:00:00');
@@ -66,13 +66,19 @@ export function StatusBar({ botStatus, stats, scheduleStatus, startTime }: Statu
     // Update immediately
     setElapsedTime(formatElapsedTime(startTime));
 
-    // Then update every second
+    // Only keep updating if bot is running
+    if (!botStatus.isRunning) {
+      // Bot stopped - freeze the timer at current value
+      return;
+    }
+
+    // Then update every second while running
     const interval = setInterval(() => {
       setElapsedTime(formatElapsedTime(startTime));
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [startTime]);
+  }, [startTime, botStatus.isRunning]);
 
   // Fetch Oxylabs usage
   const fetchProxyUsage = useCallback(async () => {
@@ -136,6 +142,10 @@ export function StatusBar({ botStatus, stats, scheduleStatus, startTime }: Statu
         <div className="stat">
           <span className="label">Errors</span>
           <span className="value">{stats.totalErrors}</span>
+        </div>
+        <div className="stat">
+          <span className="label">IP Changes</span>
+          <span className="value">{stats.totalIpChanges || 0}</span>
         </div>
       </div>
 

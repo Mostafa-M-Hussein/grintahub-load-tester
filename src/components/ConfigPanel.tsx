@@ -552,51 +552,86 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
         <legend>Target Websites</legend>
         <div className="form-group">
           <label style={{ marginBottom: '10px', display: 'block' }}>
-            Select which websites to click ads for:
+            Domains to click ads for (e.g., example.com):
           </label>
-          <div className="target-domains-selector" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={localConfig.targetDomains?.includes('grintahub.com') ?? true}
-                onChange={e => {
-                  const current = localConfig.targetDomains || ['grintahub.com'];
-                  const newDomains = e.target.checked
-                    ? [...current.filter(d => d !== 'grintahub.com'), 'grintahub.com']
-                    : current.filter(d => d !== 'grintahub.com');
-                  // Ensure at least one domain is selected
-                  if (newDomains.length > 0) {
-                    handleChange('targetDomains', newDomains);
-                  }
-                }}
-              />
-              <span>grintahub.com</span>
-              <span style={{ color: '#888', fontSize: '0.85em' }}>(default)</span>
-            </label>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={localConfig.targetDomains?.includes('golden4tic.com') ?? false}
-                onChange={e => {
-                  const current = localConfig.targetDomains || ['grintahub.com'];
-                  const newDomains = e.target.checked
-                    ? [...current.filter(d => d !== 'golden4tic.com'), 'golden4tic.com']
-                    : current.filter(d => d !== 'golden4tic.com');
-                  // Ensure at least one domain is selected
-                  if (newDomains.length > 0) {
-                    handleChange('targetDomains', newDomains);
-                  }
-                }}
-              />
-              <span>golden4tic.com</span>
-            </label>
+
+          {/* List of current domains */}
+          <div className="target-domains-list" style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '10px' }}>
+            {(localConfig.targetDomains || ['grintahub.com']).map((domain, index) => (
+              <div key={index} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 10px', background: '#2a2a2a', borderRadius: '4px' }}>
+                <span style={{ flex: 1 }}>{domain}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const current = localConfig.targetDomains || ['grintahub.com'];
+                    if (current.length > 1) {
+                      handleChange('targetDomains', current.filter((_, i) => i !== index));
+                    }
+                  }}
+                  disabled={localConfig.targetDomains?.length === 1}
+                  style={{
+                    background: localConfig.targetDomains?.length === 1 ? '#444' : '#a33',
+                    border: 'none',
+                    color: '#fff',
+                    padding: '2px 8px',
+                    borderRadius: '3px',
+                    cursor: localConfig.targetDomains?.length === 1 ? 'not-allowed' : 'pointer',
+                    fontSize: '0.85em'
+                  }}
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
           </div>
+
+          {/* Add new domain input */}
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <input
+              type="text"
+              id="newDomainInput"
+              placeholder="Enter domain (e.g., example.com)"
+              style={{ flex: 1 }}
+              onKeyDown={e => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  const input = e.target as HTMLInputElement;
+                  const newDomain = input.value.trim().toLowerCase()
+                    .replace(/^https?:\/\//, '')  // Remove http:// or https://
+                    .replace(/\/.*$/, '')          // Remove path
+                    .replace(/^www\./, '');        // Remove www.
+                  if (newDomain && !localConfig.targetDomains?.includes(newDomain)) {
+                    handleChange('targetDomains', [...(localConfig.targetDomains || []), newDomain]);
+                    input.value = '';
+                  }
+                }
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => {
+                const input = document.getElementById('newDomainInput') as HTMLInputElement;
+                const newDomain = input.value.trim().toLowerCase()
+                  .replace(/^https?:\/\//, '')
+                  .replace(/\/.*$/, '')
+                  .replace(/^www\./, '');
+                if (newDomain && !localConfig.targetDomains?.includes(newDomain)) {
+                  handleChange('targetDomains', [...(localConfig.targetDomains || []), newDomain]);
+                  input.value = '';
+                }
+              }}
+              style={{ background: '#2a6a2a', border: 'none', color: '#fff', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}
+            >
+              Add
+            </button>
+          </div>
+
           <small className="form-hint" style={{ marginTop: '8px' }}>
-            The bot will click ads for selected websites. Select one or both.
+            The bot will only click SPONSORED ADS for these domains. Press Enter or click Add.
           </small>
           {(localConfig.targetDomains?.length === 0 || !localConfig.targetDomains) && (
             <div style={{ color: '#f66', marginTop: '5px', fontSize: '0.9em' }}>
-              At least one target must be selected
+              At least one target domain is required
             </div>
           )}
         </div>
