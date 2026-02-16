@@ -47,12 +47,17 @@ fn extract_session_id_from_cmdline(cmdline: &str) -> Option<String> {
     None
 }
 
-/// Get active session IDs from the pool
+/// Get active data-dir session IDs from the pool.
+///
+/// These are the UUID-based IDs used in Chrome's `--user-data-dir` path,
+/// NOT the display names (Bot-1, Bot-2, etc.).
+/// The zombie cleaner extracts session IDs from Chrome's command line,
+/// which contains the data-dir ID, so we must compare against those.
 async fn get_active_session_ids(pool: &Arc<BrowserPool>) -> HashSet<String> {
     pool.get_all_session_info()
         .await
         .into_iter()
-        .map(|info| info.id)
+        .map(|info| info.data_dir_id)
         .collect()
 }
 

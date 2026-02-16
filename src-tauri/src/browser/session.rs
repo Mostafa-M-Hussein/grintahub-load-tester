@@ -255,8 +255,11 @@ impl BrowserSessionConfig {
 
 /// A browser session for automation
 pub struct BrowserSession {
-    /// Unique session ID
+    /// Unique session ID (display name, e.g. "Bot-1")
     pub id: String,
+    /// The data directory session ID (UUID-based, used in --user-data-dir path)
+    /// This is what appears in Chrome's command line and is used by the zombie cleaner.
+    pub data_dir_id: String,
     /// The browser instance
     browser: Arc<RwLock<Option<Browser>>>,
     /// Current active page (ChaserPage wraps Page with stealth execution)
@@ -289,6 +292,16 @@ impl BrowserSession {
     /// Create a new browser session with the given config
     pub async fn new(config: BrowserSessionConfig) -> Result<Self, BrowserError> {
         let session_id = format!("Bot-{}", BOT_COUNTER.fetch_add(1, Ordering::Relaxed));
+
+        // Extract the data_dir_id from user_data_dir path (the last component of the path)
+        // This is the UUID-based ID used in --user-data-dir and matched by the zombie cleaner.
+        let data_dir_id = config.user_data_dir.as_ref()
+            .and_then(|dir| {
+                std::path::Path::new(dir)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
 
         info!("Launching browser session {} (headless: {})", session_id, config.headless);
 
@@ -475,12 +488,17 @@ impl BrowserSession {
             .await
             .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
 
-        // Spawn handler in background
+        // Spawn handler in background — when handler ends, Chrome has disconnected
         let session_id_clone = session_id.clone();
+        let alive_flag = Arc::new(AtomicBool::new(true));
+        let alive_for_handler = alive_flag.clone();
         tokio::spawn(async move {
             while let Some(event) = handler.next().await {
                 debug!("Session {} browser event: {:?}", session_id_clone, event);
             }
+            // Handler ended = Chrome disconnected or crashed
+            warn!("Session {} Chrome disconnected (event handler ended)", session_id_clone);
+            alive_for_handler.store(false, Ordering::Relaxed);
         });
 
         // Get existing page or create new one (Chrome opens with a blank tab)
@@ -543,11 +561,12 @@ impl BrowserSession {
 
         Ok(Self {
             id: session_id,
+            data_dir_id,
             browser: Arc::new(RwLock::new(Some(browser))),
             page: Arc::new(RwLock::new(Some(chaser))),
             profile,
             config,
-            alive: Arc::new(AtomicBool::new(true)),
+            alive: alive_flag,
             current_ip: Arc::new(RwLock::new(None)),
             previous_ip: Arc::new(RwLock::new(None)),
             ip_change_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1099,9 +1118,10 @@ impl BrowserSession {
 
     /// Close the browser session
     pub async fn close(&self) -> Result<(), BrowserError> {
+        // Mark as not alive first to prevent new operations
         self.alive.store(false, Ordering::Relaxed);
 
-        // Close page (ChaserPage wraps Page - clone to get owned Page for close)
+        // 1. Close page first (stops navigation/JS execution)
         {
             let mut chaser = self.page.write().await;
             if let Some(c) = chaser.take() {
@@ -1109,18 +1129,20 @@ impl BrowserSession {
             }
         }
 
-        // Close browser - try graceful close first, then force kill
+        // 2. Close browser - try graceful close, give it a moment, then force kill
         {
             let mut browser = self.browser.write().await;
             if let Some(mut b) = browser.take() {
-                // Try graceful close first
+                // Try graceful close first (sends Browser.close CDP command)
                 let _ = b.close().await;
+                // Brief grace period for Chrome child processes to exit
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 // Force kill to ensure all Chrome processes are terminated (fixes Windows zombie issue)
                 let _ = b.kill().await;
             }
         }
 
-        // Stop local proxy forwarder
+        // 3. Stop local proxy forwarder after browser is dead
         {
             let mut forwarder = self.proxy_forwarder.write().await;
             if let Some(mut f) = forwarder.take() {

@@ -16,6 +16,8 @@ use crate::proxy::GlobalProxyManager;
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub id: String,
+    /// The data directory session ID (UUID-based, used in --user-data-dir path)
+    pub data_dir_id: String,
     pub alive: bool,
     pub current_ip: Option<String>,
     pub previous_ip: Option<String>,
@@ -250,6 +252,7 @@ impl BrowserPool {
 
             infos.push(SessionInfo {
                 id: id.clone(),
+                data_dir_id: session.data_dir_id.clone(),
                 alive: session.is_alive(),
                 current_ip,
                 previous_ip,

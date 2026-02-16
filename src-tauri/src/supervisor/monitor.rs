@@ -145,8 +145,8 @@ impl SessionSupervisor {
                     }
                 }
 
-                // Zombie Chrome cleanup every ~20 seconds (every 2nd tick at 10s interval)
-                // More frequent cleanup prevents Chrome window pile-up on Windows
+                // Zombie Chrome cleanup every ~10 seconds (every 2nd tick at 5s interval)
+                // Cleans up Chrome processes whose data-dir session ID is no longer in the pool
                 if tick_counter % 2 == 0 {
                     let killed = super::zombie::cleanup_zombie_chromes(&browser_pool).await;
                     if killed > 0 {
