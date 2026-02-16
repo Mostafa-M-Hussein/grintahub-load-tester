@@ -2,7 +2,8 @@
 # Multi-stage build for smaller final image
 
 # ===== Stage 1: Build =====
-FROM rust:latest AS builder
+# Use rust:bookworm to match runtime GLIBC version
+FROM rust:bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -46,14 +47,16 @@ COPY --from=builder /app/target/release/server /app/grintahub-server
 # Copy web assets (React dashboard build)
 COPY dist /app/dist
 
-# Set ownership
-RUN chown -R grintahub:grintahub /app
-
-# Switch to non-root user
-USER grintahub
+# Create config and logs directories with proper ownership
+RUN mkdir -p /home/grintahub/.config/grintahub-clicker/logs \
+    && chown -R grintahub:grintahub /home/grintahub/.config \
+    && chown -R grintahub:grintahub /app
 
 # Config directory for persistence
 VOLUME ["/home/grintahub/.config/grintahub-clicker"]
+
+# Switch to non-root user
+USER grintahub
 
 # Expose web dashboard port
 EXPOSE 8080
