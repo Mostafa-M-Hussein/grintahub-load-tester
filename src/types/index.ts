@@ -18,6 +18,8 @@ export interface AppConfig {
   accounts?: SavedAccount[];
   // Auto-rotate IP after all keywords are searched (change IP on keyword cycle completion)
   autoRotateIp?: boolean;
+  // Pick keywords randomly instead of cycling sequentially
+  randomKeywords?: boolean;
   // Target domains to click ads for (e.g., ["grintahub.com", "golden4tic.com"])
   targetDomains?: string[];
 }

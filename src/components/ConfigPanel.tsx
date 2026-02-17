@@ -478,6 +478,17 @@ export function ConfigPanel({ config, onSave, disabled }: ConfigPanelProps) {
           <small className="form-hint">Restart session with new IP after completing all keyword searches</small>
         </div>
         <div className="form-group">
+          <label>
+            <input
+              type="checkbox"
+              checked={localConfig.randomKeywords || false}
+              onChange={e => handleChange('randomKeywords', e.target.checked)}
+            />
+            Random Keyword Order
+          </label>
+          <small className="form-hint">Pick keywords randomly instead of cycling sequentially</small>
+        </div>
+        <div className="form-group">
           <label>Max Clicks per Session: {localConfig.maxClicksPerSession || 0} {localConfig.maxClicksPerSession === 0 || !localConfig.maxClicksPerSession ? '(unlimited)' : ''}</label>
           <input
             type="number"

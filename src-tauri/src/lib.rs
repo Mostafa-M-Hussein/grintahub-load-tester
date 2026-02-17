@@ -87,6 +87,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub auto_rotate_ip: bool,
 
+    /// Pick keywords randomly instead of cycling sequentially
+    #[serde(default)]
+    pub random_keywords: bool,
+
     /// Target domains to click ads for (e.g., ["grintahub.com", "golden4tic.com"])
     /// Empty = default to grintahub.com only
     #[serde(default = "default_target_domains")]
@@ -126,6 +130,7 @@ impl Default for AppConfig {
             schedule: ScheduleConfig::default(),
             accounts: vec![],
             auto_rotate_ip: true,  // Rotate IP after completing all keywords
+            random_keywords: true, // Pick keywords randomly by default
             target_domains: default_target_domains(),
         }
     }
@@ -180,10 +185,22 @@ impl AppConfig {
 
             match serde_json::to_string_pretty(self) {
                 Ok(content) => {
-                    if let Err(e) = std::fs::write(&path, content) {
-                        error!("Failed to save config: {}", e);
-                    } else {
-                        info!("Config saved to {:?}", path);
+                    // Atomic save: write to .tmp then rename to prevent data loss on crash
+                    let tmp_path = path.with_extension("json.tmp");
+                    match std::fs::write(&tmp_path, &content) {
+                        Ok(()) => {
+                            if let Err(e) = std::fs::rename(&tmp_path, &path) {
+                                // rename failed — try direct write as fallback
+                                warn!("Atomic rename failed ({}), falling back to direct write", e);
+                                if let Err(e2) = std::fs::write(&path, &content) {
+                                    error!("Failed to save config: {}", e2);
+                                }
+                            }
+                            info!("Config saved to {:?}", path);
+                        }
+                        Err(e) => {
+                            error!("Failed to write config tmp file: {}", e);
+                        }
                     }
                 }
                 Err(e) => {

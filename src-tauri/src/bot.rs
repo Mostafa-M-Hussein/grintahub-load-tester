@@ -76,7 +76,8 @@ pub struct OxylabsUsage {
 
 /// Start the bot - shared logic for both Tauri and web server modes.
 pub async fn start_bot_logic(state: &AppState) -> Result<(), String> {
-    if state.is_running.load(Ordering::SeqCst) {
+    // Atomic check-and-set to prevent double-start race
+    if state.is_running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return Err("Bot is already running".into());
     }
 
@@ -122,12 +123,18 @@ pub async fn start_bot_logic(state: &AppState) -> Result<(), String> {
         warn!("No 2Captcha API key configured — CAPTCHAs will cause IP rotation");
     }
 
-    let session_ids = state.browser_pool
+    let session_ids = match state.browser_pool
         .spawn_sessions_with_options(config.concurrent_sessions, Some(config.headless))
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            // Reset is_running since we set it to true at the top
+            state.is_running.store(false, Ordering::SeqCst);
+            return Err(e.to_string());
+        }
+    };
 
-    state.is_running.store(true, Ordering::SeqCst);
     state.global_stats.reset();
 
     let google_account: Option<GoogleAccount> = config.accounts
@@ -161,10 +168,12 @@ pub async fn start_bot_logic(state: &AppState) -> Result<(), String> {
     let keywords = config.keywords.clone();
     let max_clicks = config.max_clicks_per_session;
     let auto_rotate_ip = config.auto_rotate_ip;
+    let random_keywords = config.random_keywords;
     let captcha_api_key = config.captcha_api_key.clone();
     let target_domains = config.target_domains.clone();
 
-    info!("Bot loop started with {} sessions (auto_rotate_ip: {}, targets: {:?})", session_ids.len(), auto_rotate_ip, target_domains);
+    info!("Bot loop started with {} sessions (auto_rotate_ip: {}, random_keywords: {}, targets: {:?})",
+        session_ids.len(), auto_rotate_ip, random_keywords, target_domains);
 
     for session_id in session_ids {
         spawn_session_task_safe(
@@ -177,6 +186,7 @@ pub async fn start_bot_logic(state: &AppState) -> Result<(), String> {
             max_clicks,
             google_account.clone(),
             auto_rotate_ip,
+            random_keywords,
             captcha_api_key.clone(),
             target_domains.clone(),
         );
@@ -778,6 +788,7 @@ pub fn spawn_session_task_safe(
     max_clicks: u32,
     google_account: Option<GoogleAccount>,
     auto_rotate_ip: bool,
+    random_keywords: bool,
     captcha_api_key: String,
     target_domains: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
@@ -790,7 +801,7 @@ pub fn spawn_session_task_safe(
             run_session_loop(
                 session_id, pool, stats, rate_config,
                 is_running, keywords, max_clicks, google_account,
-                auto_rotate_ip, captcha_api_key, target_domains,
+                auto_rotate_ip, random_keywords, captcha_api_key, target_domains,
             )
         );
 
@@ -834,6 +845,7 @@ async fn run_session_loop(
     max_clicks: u32,
     google_account: Option<GoogleAccount>,
     auto_rotate_ip: bool,
+    random_keywords: bool,
     _captcha_api_key: String,  // Reserved for future use
     target_domains: Vec<String>,
 ) {
@@ -865,7 +877,7 @@ async fn run_session_loop(
     let mut session_clicks: u32 = 0;
     let mut consecutive_errors: u32 = 0;
     let mut already_logged_in = false;
-    let mut ip_rotation_count: u32 = 0;
+    let ip_rotation_count: u32 = 0; // tracked by supervisor (each respawn = new IP)
     let keyword_count = keywords.len();
 
     while is_running.load(Ordering::SeqCst) {
@@ -879,7 +891,13 @@ async fn run_session_loop(
 
         // DISABLED: organic search mixing — going straight to target keywords for testing
 
-        let keyword = &keywords[keyword_index % keywords.len()];
+        let kw_idx = if random_keywords {
+            use rand::Rng;
+            rand::thread_rng().gen_range(0..keywords.len())
+        } else {
+            keyword_index % keywords.len()
+        };
+        let keyword = &keywords[kw_idx];
         keyword_index += 1;
 
         let _cycle_start = std::time::Instant::now();  // Reserved for latency tracking
@@ -903,8 +921,23 @@ async fn run_session_loop(
                     rate_limiter.record_success();
                     session_clicks += 1;
                     consecutive_errors = 0;
-                }
 
+                    // Anti-detection: Limit to 1-2 clicks per IP, then rotate
+                    // Real users don't click multiple ads from the same IP in quick succession
+                    let max_clicks_per_ip = 2u32;
+                    if session_clicks >= max_clicks_per_ip {
+                        // Cooldown period (30-60 seconds) before IP rotation
+                        // This simulates natural browsing patterns
+                        let cooldown_ms = {
+                            use rand::Rng;
+                            rand::thread_rng().gen_range(30_000..=60_000)
+                        };
+                        info!("Session {} reached {} clicks on this IP — cooling down {}s before IP rotation",
+                            session_id, session_clicks, cooldown_ms / 1000);
+                        tokio::time::sleep(Duration::from_millis(cooldown_ms)).await;
+                        break; // Exit for supervisor respawn with new IP
+                    }
+                }
             }
             Err(BrowserError::CaptchaDetected(msg)) => {
                 warn!("Session {} CAPTCHA detected: {} — exiting for supervisor respawn", session_id, msg);
@@ -914,10 +947,9 @@ async fn run_session_loop(
                 break;
             }
             Err(BrowserError::ElementNotFound(msg)) if msg.contains("need new IP") => {
-                // No ad found for this keyword - just try the next keyword, don't exit
-                info!("Session {} no ad found for current keyword, trying next keyword", session_id);
-                // Continue to next iteration (keyword already incremented above)
-                continue;
+                // No ad found — rotate IP immediately instead of cycling keywords
+                info!("Session {} no ad found — exiting for supervisor respawn with new IP", session_id);
+                break;
             }
             Err(BrowserError::Timeout(msg)) |
             Err(BrowserError::NavigationFailed(msg)) |

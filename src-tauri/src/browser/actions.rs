@@ -1459,6 +1459,51 @@ impl BrowserActions {
         }
 
         // ================================================================
+        // PRE-CLICK BEHAVIOR: Hover over other results first (anti-detection)
+        // Real users scan multiple results before deciding which to click
+        // ================================================================
+        {
+            // Get positions of other search results to hover over
+            let other_results = session.execute_js(r#"
+                (function() {
+                    const results = [];
+                    // Get organic results (not ads) to hover over
+                    document.querySelectorAll('div.g h3, div[data-hveid] h3').forEach((h3, i) => {
+                        if (i < 5) {
+                            const rect = h3.getBoundingClientRect();
+                            if (rect.top > 0 && rect.top < window.innerHeight) {
+                                results.push({
+                                    x: rect.left + rect.width / 2,
+                                    y: rect.top + rect.height / 2
+                                });
+                            }
+                        }
+                    });
+                    return results;
+                })()
+            "#).await.unwrap_or_default();
+
+            // Hover over 1-3 other results before the target
+            if let Some(results) = other_results.as_array() {
+                // Generate hover_count before any await (RNG is not Send)
+                let hover_count = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(1..=3).min(results.len())
+                };
+                for i in 0..hover_count {
+                    if let Some(r) = results.get(i) {
+                        let hx = r.get("x").and_then(|v| v.as_f64()).unwrap_or(300.0);
+                        let hy = r.get("y").and_then(|v| v.as_f64()).unwrap_or(200.0);
+                        // Move to this result
+                        session.move_mouse_human(hx, hy).await.ok();
+                        // Pause as if reading the title (300-800ms)
+                        Self::random_delay(300, 800).await;
+                    }
+                }
+            }
+        }
+
+        // ================================================================
         // METHOD 1: CDP mouse hover + bezier click (isTrusted: true)
         // ================================================================
         info!("Session {} METHOD 1: CDP hover + bezier click", session.id);
@@ -1471,7 +1516,8 @@ impl BrowserActions {
             session.move_mouse_human(scan_x, scan_y).await.ok();
             Self::random_delay(300, 600).await;
             session.move_mouse_human(x, y).await.ok();
-            Self::random_delay(600, 900).await;
+            // Extended pre-click delay: 500-2000ms (human decision time)
+            Self::random_delay(500, 2000).await;
         }
         session.click_human_at(x, y).await?;
 
@@ -2143,19 +2189,32 @@ impl BrowserActions {
                 .join(",");
 
             // Wait for page load (check document.readyState and URL)
+            // Track redirect chain for debugging
             let mut landed_on_target = false;
+            let mut redirect_chain: Vec<String> = Vec::new();
+            let mut last_error: Option<String> = None;
+
             for attempt in 0..10 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let check_js = format!(r#"
                     (function() {{
                         const targets = [{}];
                         const hostname = window.location.hostname.toLowerCase();
+                        const url = window.location.href;
                         const onTarget = targets.some(t => hostname.includes(t.replace('.com', '').replace('.', '')));
+                        // Detect error pages
+                        const isError = url.startsWith('chrome-error://') ||
+                                        url.startsWith('about:') ||
+                                        url.startsWith('chrome://') ||
+                                        document.title.toLowerCase().includes('error') ||
+                                        document.body?.innerText?.includes('ERR_');
                         return {{
-                            url: window.location.href,
+                            url: url,
                             ready: document.readyState,
                             onTarget: onTarget,
-                            hostname: hostname
+                            hostname: hostname,
+                            isError: isError,
+                            title: document.title || ''
                         }};
                     }})()
                 "#, targets_js);
@@ -2163,9 +2222,25 @@ impl BrowserActions {
 
                 match page_state {
                     Ok(state) => {
+                        let url = state.get("url").and_then(|v| v.as_str()).unwrap_or("");
                         let on_target = state.get("onTarget").and_then(|v| v.as_bool()).unwrap_or(false);
                         let ready = state.get("ready").and_then(|v| v.as_str()).unwrap_or("loading");
                         let hostname = state.get("hostname").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let is_error = state.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let title = state.get("title").and_then(|v| v.as_str()).unwrap_or("");
+
+                        // Track redirect chain
+                        if redirect_chain.last().map(|s| s.as_str()) != Some(url) && !url.is_empty() {
+                            redirect_chain.push(url.to_string());
+                        }
+
+                        // Detect error pages immediately
+                        if is_error {
+                            last_error = Some(format!("Error page detected: {} (title: {})", url, title));
+                            warn!("Session {} redirect landed on ERROR page: {} - aborting", session.id, safe_truncate(url, 80));
+                            break;
+                        }
+
                         if on_target {
                             landed_on_target = true;
                             session.increment_clicks();
@@ -2181,6 +2256,18 @@ impl BrowserActions {
                         // JS failed — page may be stuck loading through dead proxy.
                         // Use CDP-level URL check as fallback (works even during loading).
                         if let Ok(cdp_url) = session.get_current_url().await {
+                            // Track in redirect chain
+                            if redirect_chain.last().map(|s| s.as_str()) != Some(&cdp_url) && !cdp_url.is_empty() {
+                                redirect_chain.push(cdp_url.clone());
+                            }
+
+                            // Check for error URLs
+                            if cdp_url.starts_with("chrome-error://") || cdp_url.starts_with("about:") {
+                                last_error = Some(format!("Browser error page: {}", cdp_url));
+                                warn!("Session {} redirect failed with browser error: {}", session.id, safe_truncate(&cdp_url, 80));
+                                break;
+                            }
+
                             let cdp_host = cdp_url.split('/').nth(2).unwrap_or("").to_lowercase();
                             let on_target = targets.iter().any(|t| {
                                 let simple = t.replace(".com", "").replace(".net", "").replace(".org", "");
@@ -2201,26 +2288,37 @@ impl BrowserActions {
                 }
             }
 
-            // Click counted above when landing confirmed - dwell is just for anti-detection
-            if !landed_on_target {
-                // Still count it - the METHOD SUCCESS means click happened
-                session.increment_clicks();
-                if let Some(s) = stats {
-                    s.record_click(0);
-                }
-                warn!("Session {} click detected but didn't confirm landing - still counting as success [CLICK COUNTED]", session.id);
+            // Log redirect chain for debugging
+            if !redirect_chain.is_empty() {
+                debug!("Session {} redirect chain: {}", session.id,
+                    redirect_chain.iter().map(|u| safe_truncate(u, 50)).collect::<Vec<_>>().join(" -> "));
             }
 
-            // 4. Browse the target page (non-fatal - click already counted above)
+            // Handle explicit errors
+            if let Some(error) = last_error {
+                warn!("Session {} click failed due to redirect error: {}", session.id, error);
+                return Ok(false);
+            }
+
+            // Stricter verification: only count clicks with confirmed landing
+            // This prevents counting clicks that didn't actually reach the target
+            if !landed_on_target {
+                warn!("Session {} click happened but landing NOT confirmed - NOT counting (stricter verification)", session.id);
+                // Don't count the click - return false to indicate no verified click
+                return Ok(false);
+            }
+
+            // 4. Browse the target page (click was counted above when landing confirmed)
             let browse_start = std::time::Instant::now();
             if let Err(e) = Self::browse_target_page(session).await {
                 warn!("Session {} browse error (click already counted): {}", session.id, e);
             }
             let browse_elapsed = browse_start.elapsed().as_millis() as u64;
 
-            // 5. Brief dwell on landing page — anti-detection only, click already counted
-            let min_dwell_ms: u64 = 10_000;
-            let max_dwell_ms: u64 = 25_000;
+            // 5. Extended dwell on landing page — anti-detection, simulates real user
+            // Increased from 10-25s to 15-45s for more natural behavior
+            let min_dwell_ms: u64 = 15_000;
+            let max_dwell_ms: u64 = 45_000;
             let dwell_time = {
                 let mut rng = rand::thread_rng();
                 rng.gen_range(min_dwell_ms..=max_dwell_ms)

@@ -36,6 +36,16 @@ const MAX_HEADERS: usize = 100;
 /// Max size of a single header line (8KB)
 const MAX_HEADER_LINE: usize = 8192;
 
+/// Check if a target domain is ad-related (needs longer timeouts and more retries)
+fn is_ad_domain(target: &str) -> bool {
+    let target_lower = target.to_lowercase();
+    target_lower.contains("googleadservices.com")
+        || target_lower.contains("googlesyndication.com")
+        || target_lower.contains("doubleclick.net")
+        || (target_lower.contains("clients") && target_lower.contains("google.com"))
+        || target_lower.contains("adservice")
+}
+
 /// Local proxy forwarder that handles authentication to upstream proxy
 pub struct LocalProxyForwarder {
     /// Local port to listen on
@@ -261,22 +271,37 @@ async fn handle_connect(
 
     info!("CONNECT to upstream: {} -> {}", target, upstream_host);
 
+    // Ad domains need longer timeouts and more retries (Oxylabs often slow for these)
+    let is_ad = is_ad_domain(target);
+    let max_retries = if is_ad { 4u32 } else { 2u32 };
+    let connect_timeout = if is_ad { 30u64 } else { 10u64 };
+
+    if is_ad {
+        debug!("Ad domain detected: {} - using extended timeout ({}s) and {} retries",
+               target, connect_timeout, max_retries);
+    }
+
     // Retry loop for transient upstream errors (e.g. Oxylabs 522 timeouts)
-    let max_retries = 2u32;
     let mut upstream: Option<TcpStream> = None;
     let mut last_error_response = String::new();
     let mut last_error_headers: Vec<String> = Vec::new();
 
     for attempt in 0..=max_retries {
         if attempt > 0 {
-            let backoff_ms = if attempt == 1 { 200 } else { 400 };
+            // Exponential backoff: 200ms, 500ms, 1000ms, 2000ms
+            let backoff_ms = match attempt {
+                1 => 200,
+                2 => 500,
+                3 => 1000,
+                _ => 2000,
+            };
             warn!("CONNECT retry {}/{} for {} after {}ms backoff", attempt, max_retries, target, backoff_ms);
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         }
 
-        // Connect to upstream proxy with timeout
+        // Connect to upstream proxy with timeout (longer for ad domains)
         let mut conn = match tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(connect_timeout),
             TcpStream::connect(&upstream_addr)
         ).await {
             Ok(Ok(c)) => c,

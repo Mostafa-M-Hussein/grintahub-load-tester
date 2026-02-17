@@ -81,6 +81,7 @@ impl SessionSupervisor {
                 let auto_rotate_ip = config.auto_rotate_ip;
                 let captcha_api_key = config.captcha_api_key.clone();
                 let headless = config.headless;
+                let random_keywords = config.random_keywords;
                 let target_domains = config.target_domains.clone();
 
                 // Extract Google account
@@ -110,9 +111,6 @@ impl SessionSupervisor {
                         current, target, to_spawn
                     );
 
-                    // Correct the active_sessions counter to match reality
-                    global_stats.set_active_sessions(current as u64);
-
                     // Spawn replacement sessions
                     match browser_pool.spawn_sessions_with_options(to_spawn, Some(headless)).await {
                         Ok(session_ids) => {
@@ -134,6 +132,7 @@ impl SessionSupervisor {
                                     max_clicks,
                                     google_account.clone(),
                                     auto_rotate_ip,
+                                    random_keywords,
                                     captcha_api_key.clone(),
                                     target_domains.clone(),
                                 );

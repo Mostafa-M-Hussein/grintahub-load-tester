@@ -495,9 +495,9 @@ impl BrowserSession {
             }
 
             // Bypass proxy for non-essential Chrome background services only.
-            // NOTE: Do NOT bypass clients*.google.com — Google Ads redirects use
-            // ogads-pa.clients6.google.com for ad click tracking. Bypassing these
-            // causes the ad redirect to go direct (wrong IP) instead of through proxy.
+            // IMPORTANT: Ad tracking domains (googleadservices.com, clients*.google.com)
+            // must go THROUGH proxy to maintain consistent IP throughout the click chain.
+            // This prevents IP mismatch between search and click (fraud detection signal).
             builder = builder.arg(("proxy-bypass-list",
                 "mtalk.google.com;\
                  alt1-mtalk.google.com;\
@@ -1028,8 +1028,8 @@ impl BrowserSession {
         page.execute(mouse_down).await
             .map_err(|e| BrowserError::JavaScriptError(format!("CDP mouseDown failed: {}", e)))?;
 
-        // Hold duration (40-120ms like real clicks)
-        let hold = rng.gen_range(40..120);
+        // Hold duration (50-150ms like real clicks - slightly longer for more natural feel)
+        let hold = rng.gen_range(50..150);
         tokio::time::sleep(Duration::from_millis(hold)).await;
 
         // Mouse up
