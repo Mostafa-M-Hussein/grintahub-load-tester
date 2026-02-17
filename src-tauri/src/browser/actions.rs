@@ -1381,7 +1381,7 @@ impl BrowserActions {
     /// Perform click on an ad using MULTIPLE methods until one works.
     /// Tries 7 different click strategies — from most natural (CDP) to most reliable (direct nav).
     /// Returns true if any method navigated away from the search page.
-    async fn cdp_click_ad(session: &Arc<BrowserSession>, result: &serde_json::Value, phase: &str) -> Result<bool, BrowserError> {
+    async fn cdp_click_ad(session: &Arc<BrowserSession>, result: &serde_json::Value, phase: &str, targets: &[String]) -> Result<bool, BrowserError> {
         let ready = result.get("ready_for_cdp_click").and_then(|v| v.as_bool()).unwrap_or(false);
         if !ready {
             return Ok(false);
@@ -1397,35 +1397,54 @@ impl BrowserActions {
         info!("Session {} clicking target ad {} ({} found, type: {}, text: '{}')",
             session.id, phase, count, ad_type, safe_truncate(text, 60));
 
+        // Build JS target matching code for fallback methods
+        let targets_js: String = targets.iter()
+            .map(|d| {
+                let simple = d.replace(".com", "").replace(".net", "").replace(".org", "");
+                format!("'{}', '{}'", d.replace('\'', "\\'"), simple.replace('\'', "\\'"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
         // Record URL before click
         let url_before = session.execute_js("window.location.href").await
             .ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
 
-        // Helper: poll for navigation (URL change + readyState)
+        // Helper: poll for navigation (URL change is sufficient — don't wait for readyState)
+        // Uses both JS and CDP-level URL check. CDP works even when page is stuck loading
+        // (e.g., target site unreachable through proxy — JS hangs but CDP still reports the URL).
         async fn poll_navigation(session: &Arc<BrowserSession>, url_before: &str, max_polls: u32) -> (bool, String, bool) {
             let mut url_after = String::new();
             let mut navigated = false;
             for poll in 0..max_polls {
                 tokio::time::sleep(Duration::from_millis(400)).await;
-                let state = session.execute_js(r#"
-                    ({ url: window.location.href, ready: document.readyState })
-                "#).await;
+
+                // Try 1: JS-level check (fast, gets readyState too)
+                let state = session.execute_js_with_timeout(
+                    r#"({ url: window.location.href, ready: document.readyState })"#,
+                    5
+                ).await;
                 if let Ok(s) = &state {
                     let url = s.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                    let ready = s.get("ready").and_then(|v| v.as_str()).unwrap_or("loading");
-                    if url != url_before && !url.is_empty() && (ready == "complete" || ready == "interactive") {
-                        url_after = url.to_string();
-                        navigated = true;
-                        debug!("Navigation settled (poll {})", poll + 1);
-                        break;
-                    }
                     if url != url_before && !url.is_empty() {
                         url_after = url.to_string();
+                        navigated = true;
+                        let ready = s.get("ready").and_then(|v| v.as_str()).unwrap_or("loading");
+                        debug!("Navigation detected via JS (poll {}, readyState={})", poll + 1, ready);
+                        break;
+                    }
+                } else {
+                    // Try 2: CDP-level URL check — works even when page is stuck loading
+                    // (JS fails when page context is destroyed/loading through dead proxy)
+                    if let Ok(cdp_url) = session.get_current_url().await {
+                        if cdp_url != url_before && !cdp_url.is_empty() {
+                            url_after = cdp_url;
+                            navigated = true;
+                            debug!("Navigation detected via CDP (poll {}, JS was unavailable)", poll + 1);
+                            break;
+                        }
                     }
                 }
-            }
-            if !navigated && !url_after.is_empty() && url_after != url_before {
-                navigated = true;
             }
             let is_error = url_after.starts_with("chrome-error://")
                 || url_after.starts_with("about:")
@@ -1466,6 +1485,10 @@ impl BrowserActions {
         // ================================================================
         // METHOD 2: CDP click at FRESH coordinates (element may have shifted)
         // ================================================================
+        if !session.is_alive() {
+            warn!("Session {} CDP connection dead before METHOD 2, bailing", session.id);
+            return Ok(false);
+        }
         warn!("Session {} METHOD 1 failed, trying METHOD 2: CDP fresh-coord click", session.id);
         let fresh_coords = session.execute_js(r#"
             (function() {
@@ -1501,54 +1524,58 @@ impl BrowserActions {
         // ================================================================
         // METHOD 3: JS full mouse event sequence + native .click()
         // ================================================================
+        if !session.is_alive() {
+            warn!("Session {} CDP connection dead before METHOD 3, bailing", session.id);
+            return Ok(false);
+        }
         warn!("Session {} METHOD 2 failed, trying METHOD 3: JS mouse events + .click()", session.id);
-        let js_result = session.execute_js(r#"
-            (async function() {
+        let js_result = session.execute_js(&format!(r#"
+            (async function() {{
+                const targets = [{targets_js}];
+                const matchesTarget = (str) => {{ const s = (str || '').toLowerCase(); return targets.some(t => s.includes(t.toLowerCase())); }};
                 let link = document.querySelector('a[data-grinta-ad-target="true"]');
-                if (!link) {
+                if (!link) {{
                     const containers = document.querySelectorAll('#tads, #tadsb, #bottomads');
-                    for (const c of containers) {
+                    for (const c of containers) {{
                         const blocks = c.querySelectorAll('[data-dtld], [data-text-ad], .uEierd');
                         const toCheck = blocks.length > 0 ? blocks : [c];
-                        for (const block of toCheck) {
+                        for (const block of toCheck) {{
                             const dtld = block.getAttribute('data-dtld') || '';
                             const txt = (block.innerText || '').toLowerCase();
                             const cites = block.querySelectorAll('cite');
-                            let found = dtld.includes('grintahub') || txt.includes('grintahub');
-                            if (!found) { for (const ci of cites) { if ((ci.textContent||'').includes('grintahub')) { found = true; break; } } }
-                            if (found) { link = block.querySelector('a[href]'); if (link) break; }
-                        }
+                            let found = matchesTarget(dtld) || matchesTarget(txt);
+                            if (!found) {{ for (const ci of cites) {{ if (matchesTarget(ci.textContent)) {{ found = true; break; }} }} }}
+                            if (found) {{ link = block.querySelector('a[href]'); if (link) break; }}
+                        }}
                         if (link) break;
-                    }
-                }
-                if (!link) return { clicked: false, reason: 'element_not_found' };
+                    }}
+                }}
+                if (!link) return {{ clicked: false, reason: 'element_not_found' }};
 
                 link.removeAttribute('target');
                 link.setAttribute('target', '_self');
-                link.scrollIntoView({ behavior: 'instant', block: 'center' });
+                link.scrollIntoView({{ behavior: 'instant', block: 'center' }});
                 await new Promise(r => setTimeout(r, 200));
                 const rect = link.getBoundingClientRect();
                 const cx = rect.left + rect.width / 2;
                 const cy = rect.top + rect.height / 2;
 
-                // Full mouse event sequence
-                const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
+                const opts = {{ bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }};
                 link.dispatchEvent(new MouseEvent('mouseenter', opts));
                 link.dispatchEvent(new MouseEvent('mouseover', opts));
                 await new Promise(r => setTimeout(r, 30));
-                link.dispatchEvent(new MouseEvent('mousedown', { ...opts, button: 0 }));
+                link.dispatchEvent(new MouseEvent('mousedown', {{ ...opts, button: 0 }}));
                 await new Promise(r => setTimeout(r, 80 + Math.random() * 40));
-                link.dispatchEvent(new MouseEvent('mouseup', { ...opts, button: 0 }));
+                link.dispatchEvent(new MouseEvent('mouseup', {{ ...opts, button: 0 }}));
                 await new Promise(r => setTimeout(r, 10));
-                link.dispatchEvent(new MouseEvent('click', { ...opts, button: 0 }));
+                link.dispatchEvent(new MouseEvent('click', {{ ...opts, button: 0 }}));
 
-                // Also try native .click()
                 await new Promise(r => setTimeout(r, 100));
                 link.click();
 
-                return { clicked: true, method: 'js_full_events', href: link.getAttribute('href') || '' };
-            })()
-        "#).await.ok();
+                return {{ clicked: true, method: 'js_full_events', href: link.getAttribute('href') || '' }};
+            }})()
+        "#, targets_js = targets_js)).await.ok();
 
         let js_clicked = js_result.as_ref()
             .and_then(|v| v.get("clicked"))
@@ -1571,31 +1598,37 @@ impl BrowserActions {
         // ================================================================
         // METHOD 4: Focus element + CDP Enter keypress
         // ================================================================
+        if !session.is_alive() {
+            warn!("Session {} CDP connection dead before METHOD 4, bailing", session.id);
+            return Ok(false);
+        }
         warn!("Session {} METHOD 3 failed, trying METHOD 4: Focus + Enter key", session.id);
-        let focus_result = session.execute_js(r#"
-            (function() {
+        let focus_result = session.execute_js(&format!(r#"
+            (function() {{
+                const targets = [{targets_js}];
+                const matchesTarget = (str) => {{ const s = (str || '').toLowerCase(); return targets.some(t => s.includes(t.toLowerCase())); }};
                 let link = document.querySelector('a[data-grinta-ad-target="true"]');
-                if (!link) {
+                if (!link) {{
                     const containers = document.querySelectorAll('#tads, #tadsb, #bottomads');
-                    for (const c of containers) {
+                    for (const c of containers) {{
                         const blocks = c.querySelectorAll('[data-dtld], [data-text-ad], .uEierd');
                         const toCheck = blocks.length > 0 ? blocks : [c];
-                        for (const block of toCheck) {
+                        for (const block of toCheck) {{
                             const dtld = block.getAttribute('data-dtld') || '';
                             const txt = (block.innerText || '').toLowerCase();
-                            let found = dtld.includes('grintahub') || txt.includes('grintahub');
-                            if (found) { link = block.querySelector('a[href]'); if (link) break; }
-                        }
+                            let found = matchesTarget(dtld) || matchesTarget(txt);
+                            if (found) {{ link = block.querySelector('a[href]'); if (link) break; }}
+                        }}
                         if (link) break;
-                    }
-                }
-                if (!link) return { focused: false };
+                    }}
+                }}
+                if (!link) return {{ focused: false }};
                 link.removeAttribute('target');
                 link.setAttribute('target', '_self');
                 link.focus();
-                return { focused: true, href: link.getAttribute('href') || '' };
-            })()
-        "#).await.ok();
+                return {{ focused: true, href: link.getAttribute('href') || '' }};
+            }})()
+        "#, targets_js = targets_js)).await.ok();
 
         let focused = focus_result.as_ref()
             .and_then(|v| v.get("focused"))
@@ -1632,7 +1665,7 @@ impl BrowserActions {
             .and_then(|v| v.as_str())
             .unwrap_or(href);
 
-        if !ad_href.is_empty() {
+        if !ad_href.is_empty() && session.is_alive() {
             warn!("Session {} METHOD 4 failed, trying METHOD 5: window.location.href", session.id);
             session.execute_js(&format!(
                 "window.location.href = {};",
@@ -1650,7 +1683,7 @@ impl BrowserActions {
         // ================================================================
         // METHOD 6: Create hidden anchor + .click() (bypasses event listeners)
         // ================================================================
-        if !ad_href.is_empty() {
+        if !ad_href.is_empty() && session.is_alive() {
             warn!("Session {} METHOD 5 failed, trying METHOD 6: anchor clone click", session.id);
             let href_json = serde_json::to_string(ad_href).unwrap_or_else(|_| format!("\"{}\"", ad_href));
             session.execute_js(&format!(r#"
@@ -1678,7 +1711,7 @@ impl BrowserActions {
         // ================================================================
         // METHOD 7: Direct navigation via session.navigate() (last resort)
         // ================================================================
-        if !ad_href.is_empty() {
+        if !ad_href.is_empty() && session.is_alive() {
             warn!("Session {} METHOD 6 failed, trying METHOD 7: direct navigate()", session.id);
             let nav_result = session.navigate(ad_href).await;
             match nav_result {
@@ -1737,7 +1770,7 @@ impl BrowserActions {
         info!("Session {} scan: {} target links ({} ads [{}via redirect], {} organic), adLabel={}, types=[{}]",
             session.id, total_target, ad_count, redirect_count, organic_count, has_ad_label, safe_truncate(ad_types, 100));
 
-        if Self::cdp_click_ad(session, &result, "initial scan").await? {
+        if Self::cdp_click_ad(session, &result, "initial scan", targets).await? {
             return Ok(true);
         }
 
@@ -1751,7 +1784,7 @@ impl BrowserActions {
             Self::random_delay(600, 900).await;
 
             let result = Self::find_and_click_target_ad(session, targets).await?;
-            if Self::cdp_click_ad(session, &result, &format!("scroll {}", step + 1)).await? {
+            if Self::cdp_click_ad(session, &result, &format!("scroll {}", step + 1), targets).await? {
                 return Ok(true);
             }
         }
@@ -1763,7 +1796,7 @@ impl BrowserActions {
         Self::random_delay(700, 1000).await;
 
         let result = Self::find_and_click_target_ad(session, targets).await?;
-        if Self::cdp_click_ad(session, &result, "bottom").await? {
+        if Self::cdp_click_ad(session, &result, "bottom", targets).await? {
             return Ok(true);
         }
 
@@ -1772,7 +1805,7 @@ impl BrowserActions {
         Self::random_delay(500, 800).await;
 
         let result = Self::find_and_click_target_ad(session, targets).await?;
-        if Self::cdp_click_ad(session, &result, "final").await? {
+        if Self::cdp_click_ad(session, &result, "final", targets).await? {
             return Ok(true);
         }
 
@@ -2135,10 +2168,9 @@ impl BrowserActions {
                         let hostname = state.get("hostname").and_then(|v| v.as_str()).unwrap_or("unknown");
                         if on_target {
                             landed_on_target = true;
-                            // *** CLICK COUNTED HERE *** - immediately when redirect confirmed
                             session.increment_clicks();
                             if let Some(s) = stats {
-                                s.record_click(0); // Latency will be updated by caller if needed
+                                s.record_click(0);
                             }
                             info!("Session {} AD CLICK SUCCESS - landed on {} (attempt {}) [CLICK COUNTED]", session.id, hostname, attempt + 1);
                             break;
@@ -2146,7 +2178,24 @@ impl BrowserActions {
                         debug!("Session {} page state: ready={}, onTarget={}, host={} (attempt {})", session.id, ready, on_target, hostname, attempt + 1);
                     }
                     Err(_) => {
-                        // Context may be destroyed during navigation - wait more
+                        // JS failed — page may be stuck loading through dead proxy.
+                        // Use CDP-level URL check as fallback (works even during loading).
+                        if let Ok(cdp_url) = session.get_current_url().await {
+                            let cdp_host = cdp_url.split('/').nth(2).unwrap_or("").to_lowercase();
+                            let on_target = targets.iter().any(|t| {
+                                let simple = t.replace(".com", "").replace(".net", "").replace(".org", "");
+                                cdp_host.contains(&simple)
+                            });
+                            if on_target {
+                                landed_on_target = true;
+                                session.increment_clicks();
+                                if let Some(s) = stats {
+                                    s.record_click(0);
+                                }
+                                info!("Session {} AD CLICK SUCCESS via CDP - URL: {} (attempt {}) [CLICK COUNTED]", session.id, safe_truncate(&cdp_url, 80), attempt + 1);
+                                break;
+                            }
+                        }
                         debug!("Session {} waiting for navigation to settle (attempt {})", session.id, attempt + 1);
                     }
                 }

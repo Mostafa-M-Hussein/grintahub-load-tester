@@ -28,23 +28,63 @@ pub fn reset_bot_counter() {
 }
 
 /// Detect the major Chrome version from the installed binary.
-/// Returns (major_version, full_version_string) e.g. (142, "142.0.7444.175")
+/// Returns (major_version, full_version_string) e.g. (144, "144.0.7559.133")
+///
+/// Uses multiple detection methods to handle cases where Chrome is already running
+/// (--version opens a tab instead of printing version on Windows).
 fn detect_chrome_version() -> Option<(u32, String)> {
     let chrome_path = find_chrome()?;
-    let output = std::process::Command::new(&chrome_path)
+
+    // Method 1: --version flag
+    if let Some(result) = detect_version_from_cli(&chrome_path) {
+        return Some(result);
+    }
+
+    // Method 2: File version metadata (Windows — works even when Chrome is running)
+    #[cfg(target_os = "windows")]
+    if let Some(result) = detect_version_from_file_metadata(&chrome_path) {
+        return Some(result);
+    }
+
+    None
+}
+
+fn detect_version_from_cli(chrome_path: &std::path::Path) -> Option<(u32, String)> {
+    let output = std::process::Command::new(chrome_path)
         .arg("--version")
         .output()
         .ok()?;
     let version_str = String::from_utf8_lossy(&output.stdout);
-    // Parse "Google Chrome 142.0.7444.175" or "Chromium 142.0.7444.175"
     let full_ver = version_str
         .split_whitespace()
         .find(|s| s.contains('.'))?
         .trim()
         .to_string();
     let major: u32 = full_ver.split('.').next()?.parse().ok()?;
-    info!("Detected Chrome version: {} (major: {})", full_ver, major);
-    Some((major, full_ver))
+    if major > 80 {
+        info!("Detected Chrome version (--version): {} (major: {})", full_ver, major);
+        return Some((major, full_ver));
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn detect_version_from_file_metadata(chrome_path: &std::path::Path) -> Option<(u32, String)> {
+    let ps_cmd = format!(
+        "(Get-Item '{}').VersionInfo.ProductVersion",
+        chrome_path.display()
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps_cmd])
+        .output()
+        .ok()?;
+    let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let major: u32 = ver.split('.').next()?.parse().ok()?;
+    if major > 80 {
+        info!("Detected Chrome version (file metadata): {} (major: {})", ver, major);
+        return Some((major, ver));
+    }
+    None
 }
 
 /// Find Chrome/Chromium executable on the system
@@ -79,12 +119,17 @@ fn find_chrome() -> Option<std::path::PathBuf> {
 }
 
 /// Create a ChaserProfile configured for Saudi Arabia
-/// Uses Linux profile to match the actual host OS — avoids platform mismatch detection.
-/// ChaserProfile::windows() was causing Google to detect inconsistency between
-/// the claimed Windows platform and the actual Linux TLS/font/header signatures.
+/// Uses platform-aware profile: Windows on Windows, Linux on Linux/Docker.
+/// This avoids TLS/fingerprint mismatch detection — Google compares the claimed
+/// platform in headers against the actual OS-level TLS cipher suites and socket behavior.
 /// Chrome version is auto-detected from the installed binary for consistency.
 fn create_saudi_profile(chrome_major: u32) -> ChaserProfile {
-    ChaserProfile::linux()
+    let base = if cfg!(target_os = "windows") {
+        ChaserProfile::windows()
+    } else {
+        ChaserProfile::linux()
+    };
+    base
         .chrome_version(chrome_major)
         .gpu(Gpu::NvidiaGTX1660) // Single GPU — no rotation (reduces fingerprint entropy)
         .memory_gb(8)
@@ -333,8 +378,8 @@ impl BrowserSession {
 
         // Set user data directory
         if let Some(ref dir) = config.user_data_dir {
-            // Create directory if it doesn't exist
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir)
+                .map_err(|e| BrowserError::LaunchFailed(format!("Failed to create data dir {}: {}", dir, e)))?;
             builder = builder.user_data_dir(dir);
         }
 
@@ -449,9 +494,10 @@ impl BrowserSession {
                 builder = builder.arg(("proxy-server", chrome_proxy.as_str()));
             }
 
-            // Bypass proxy for non-essential Google services that Oxylabs blocks/throttles
-            // These cause 403 (restricted target) and 522 (timeout) errors
-            // They are background Chrome services not needed for search/ad clicking
+            // Bypass proxy for non-essential Chrome background services only.
+            // NOTE: Do NOT bypass clients*.google.com — Google Ads redirects use
+            // ogads-pa.clients6.google.com for ad click tracking. Bypassing these
+            // causes the ad redirect to go direct (wrong IP) instead of through proxy.
             builder = builder.arg(("proxy-bypass-list",
                 "mtalk.google.com;\
                  alt1-mtalk.google.com;\
@@ -467,13 +513,7 @@ impl BrowserSession {
                  clientservices.googleapis.com;\
                  update.googleapis.com;\
                  safebrowsing.googleapis.com;\
-                 accounts.google.com;\
-                 clients1.google.com;\
-                 clients2.google.com;\
-                 clients3.google.com;\
-                 clients4.google.com;\
-                 clients5.google.com;\
-                 clients6.google.com"
+                 accounts.google.com"
             ));
         }
 
@@ -779,7 +819,7 @@ impl BrowserSession {
                 .r#type(DispatchKeyEventType::KeyDown)
                 .text(c.to_string())
                 .build()
-                .unwrap();
+                .map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
             page.execute(key_down)
                 .await
                 .map_err(|e| BrowserError::JavaScriptError(format!("CDP keyDown failed: {}", e)))?;
@@ -788,7 +828,7 @@ impl BrowserSession {
             let key_up = DispatchKeyEventParams::builder()
                 .r#type(DispatchKeyEventType::KeyUp)
                 .build()
-                .unwrap();
+                .map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
             page.execute(key_up)
                 .await
                 .map_err(|e| BrowserError::JavaScriptError(format!("CDP keyUp failed: {}", e)))?;
@@ -823,7 +863,7 @@ impl BrowserSession {
             .windows_virtual_key_code(13)
             .native_virtual_key_code(13)
             .build()
-            .unwrap();
+            .map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
         page.execute(key_down)
             .await
             .map_err(|e| BrowserError::JavaScriptError(format!("CDP Enter keyDown failed: {}", e)))?;
@@ -833,7 +873,7 @@ impl BrowserSession {
             .r#type(DispatchKeyEventType::Char)
             .text("\r")
             .build()
-            .unwrap();
+            .map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
         page.execute(char_event)
             .await
             .map_err(|e| BrowserError::JavaScriptError(format!("CDP Enter char failed: {}", e)))?;
@@ -846,7 +886,7 @@ impl BrowserSession {
             .windows_virtual_key_code(13)
             .native_virtual_key_code(13)
             .build()
-            .unwrap();
+            .map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
         page.execute(key_up)
             .await
             .map_err(|e| BrowserError::JavaScriptError(format!("CDP Enter keyUp failed: {}", e)))?;
@@ -879,7 +919,7 @@ impl BrowserSession {
                 .delta_x(0.0)
                 .delta_y((per_step + jitter) as f64)
                 .build()
-                .unwrap();
+                .map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
             page.execute(scroll)
                 .await
                 .map_err(|e| BrowserError::JavaScriptError(format!("CDP scroll failed: {}", e)))?;
@@ -940,7 +980,7 @@ impl BrowserSession {
                 .y(y)
                 .button(MouseButton::None)
                 .build()
-                .unwrap();
+                .map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
             page.execute(move_event).await.ok();
 
             // Variable delay: faster in middle, slower at start/end (ease in/out)
@@ -984,7 +1024,7 @@ impl BrowserSession {
             .button(MouseButton::Left)
             .click_count(1)
             .build()
-            .unwrap();
+            .map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
         page.execute(mouse_down).await
             .map_err(|e| BrowserError::JavaScriptError(format!("CDP mouseDown failed: {}", e)))?;
 
@@ -1000,7 +1040,7 @@ impl BrowserSession {
             .button(MouseButton::Left)
             .click_count(1)
             .build()
-            .unwrap();
+            .map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
         page.execute(mouse_up).await
             .map_err(|e| BrowserError::JavaScriptError(format!("CDP mouseUp failed: {}", e)))?;
 
@@ -1039,11 +1079,11 @@ impl BrowserSession {
                     let wrong = DispatchKeyEventParams::builder()
                         .r#type(DispatchKeyEventType::KeyDown)
                         .text(typo_char.to_string())
-                        .build().unwrap();
+                        .build().map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
                     page.execute(wrong).await.ok();
                     let up = DispatchKeyEventParams::builder()
                         .r#type(DispatchKeyEventType::KeyUp)
-                        .build().unwrap();
+                        .build().map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
                     page.execute(up).await.ok();
 
                     // Pause (noticing the mistake: 200-500ms)
@@ -1054,12 +1094,12 @@ impl BrowserSession {
                         .r#type(DispatchKeyEventType::RawKeyDown)
                         .key("Backspace").code("Backspace")
                         .windows_virtual_key_code(8)
-                        .build().unwrap();
+                        .build().map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
                     page.execute(bs_down).await.ok();
                     let bs_up = DispatchKeyEventParams::builder()
                         .r#type(DispatchKeyEventType::KeyUp)
                         .key("Backspace").code("Backspace")
-                        .build().unwrap();
+                        .build().map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
                     page.execute(bs_up).await.ok();
 
                     // Brief pause after correction (100-250ms)
@@ -1071,13 +1111,13 @@ impl BrowserSession {
             let key_down = DispatchKeyEventParams::builder()
                 .r#type(DispatchKeyEventType::KeyDown)
                 .text(c.to_string())
-                .build().unwrap();
+                .build().map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
             page.execute(key_down).await
                 .map_err(|e| BrowserError::JavaScriptError(format!("CDP keyDown failed: {}", e)))?;
 
             let key_up = DispatchKeyEventParams::builder()
                 .r#type(DispatchKeyEventType::KeyUp)
-                .build().unwrap();
+                .build().map_err(|e| BrowserError::JavaScriptError(format!("CDP build failed: {}", e)))?;
             page.execute(key_up).await
                 .map_err(|e| BrowserError::JavaScriptError(format!("CDP keyUp failed: {}", e)))?;
 
@@ -1095,21 +1135,16 @@ impl BrowserSession {
         Ok(())
     }
 
-    /// Detect current IP address via external service
+    /// Detect current IP address via fetch() — does NOT navigate away from current page
     pub async fn detect_ip(&self) -> Result<String, BrowserError> {
-        self.navigate("https://api.ipify.org?format=json").await?;
+        let result = self.execute_js(
+            r#"fetch('https://api.ipify.org?format=json').then(r=>r.json()).then(d=>d.ip||'unknown').catch(()=>'error')"#
+        ).await?;
 
-        // Wait a bit for page to load
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let result = self.execute_js("document.body.innerText").await?;
-
-        if let Some(text) = result.as_str() {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-                if let Some(ip) = json.get("ip").and_then(|v| v.as_str()) {
-                    self.set_current_ip(ip.to_string()).await;
-                    return Ok(ip.to_string());
-                }
+        if let Some(ip) = result.as_str() {
+            if ip != "unknown" && ip != "error" && !ip.is_empty() {
+                self.set_current_ip(ip.to_string()).await;
+                return Ok(ip.to_string());
             }
         }
 
@@ -1147,6 +1182,19 @@ impl BrowserSession {
             let mut forwarder = self.proxy_forwarder.write().await;
             if let Some(mut f) = forwarder.take() {
                 f.stop().await;
+            }
+        }
+
+        // 4. Clean up browser data directory to prevent disk bloat
+        if !self.data_dir_id.is_empty() {
+            let data_dir = std::env::temp_dir()
+                .join("grintahub-clicker")
+                .join("browser_data")
+                .join(&self.data_dir_id);
+            if data_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+                    debug!("Could not clean up browser data dir {:?}: {}", data_dir, e);
+                }
             }
         }
 
@@ -1258,11 +1306,18 @@ impl BrowserSession {
 
         let major = profile.chrome_version().to_string();
 
+        // Platform-aware values: must match the actual OS TLS fingerprint
+        let (ua_os_part, platform_str, platform_meta, platform_ver, arch) = if cfg!(target_os = "windows") {
+            ("Windows NT 10.0; Win64; x64", "Win32", "Windows", "10.0.0", "x86")
+        } else {
+            ("X11; Linux x86_64", "Linux x86_64", "Linux", "6.1.0", "x86")
+        };
+
         // Build the REAL User-Agent with full version (not .0.0.0 which ChaserProfile uses)
         // Real Chrome: "Chrome/142.0.7444.175" not "Chrome/142.0.0.0"
         let real_ua = format!(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{} Safari/537.36",
-            full_version
+            "Mozilla/5.0 ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{} Safari/537.36",
+            ua_os_part, full_version
         );
 
         // 1) SetUserAgentOverride with FULL metadata (platform, brands, accept-language)
@@ -1270,7 +1325,7 @@ impl BrowserSession {
         let ua_params = SetUserAgentOverrideParams {
             user_agent: real_ua,
             accept_language: Some("ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7".to_string()),
-            platform: Some("Linux x86_64".to_string()),
+            platform: Some(platform_str.to_string()),
             user_agent_metadata: Some(UserAgentMetadata {
                 brands: Some(vec![
                     UserAgentBrandVersion::new("Google Chrome", &major),
@@ -1282,9 +1337,9 @@ impl BrowserSession {
                     UserAgentBrandVersion::new("Chromium", full_version),
                     UserAgentBrandVersion::new("Not=A?Brand", "24.0.0.0"),
                 ]),
-                platform: "Linux".to_string(),
-                platform_version: "6.1.0".to_string(),
-                architecture: "x86".to_string(),
+                platform: platform_meta.to_string(),
+                platform_version: platform_ver.to_string(),
+                architecture: arch.to_string(),
                 model: String::new(),
                 mobile: false,
                 bitness: Some("64".to_string()),
@@ -1309,7 +1364,7 @@ impl BrowserSession {
             .await
             .map_err(|e| BrowserError::LaunchFailed(format!("Failed to set extra headers: {}", e)))?;
 
-        debug!("CDP headers set: Chrome/{}, Platform=Linux, Accept-Language=ar-SA", full_version);
+        debug!("CDP headers set: Chrome/{}, Platform={}, Accept-Language=ar-SA", full_version, platform_meta);
         Ok(())
     }
 
@@ -1382,8 +1437,8 @@ impl BrowserSession {
                                     {{ brand: "Not=A?Brand", version: "24.0.0.0" }}
                                 ];
                             }}
-                            if (hints.includes('platformVersion')) result.platformVersion = "6.1.0";
-                            if (hints.includes('architecture')) result.architecture = "x86";
+                            if (hints.includes('platformVersion')) result.platformVersion = "{platform_ver}";
+                            if (hints.includes('architecture')) result.architecture = "{arch}";
                             if (hints.includes('bitness')) result.bitness = "64";
                             if (hints.includes('model')) result.model = "";
                             if (hints.includes('uaFullVersion')) result.uaFullVersion = fullVer;
@@ -1399,6 +1454,8 @@ impl BrowserSession {
             }})();"#,
             full_ver = full_version,
             major = chrome_major,
+            platform_ver = if cfg!(target_os = "windows") { "10.0.0" } else { "6.1.0" },
+            arch = "x86",
         );
 
         let uad_params = AddScriptToEvaluateOnNewDocumentParams {
@@ -1556,18 +1613,15 @@ impl BrowserSession {
             "*.amazon-adsystem.com/*".to_string(),
             "*.adnxs.com/*".to_string(),
             // Chrome background services (cause proxy 403/522 errors on Oxylabs)
+            // NOTE: Do NOT block clients*.google.com — Google Ads redirects use
+            // ogads-pa.clients6.google.com for ad click tracking/redirect chain.
+            // Blocking these kills the ad redirect before it reaches the target site.
             "*mtalk.google.com*".to_string(),
             "*optimizationguide-pa.googleapis.com*".to_string(),
             "*content-autofill.googleapis.com*".to_string(),
             "*clientservices.googleapis.com*".to_string(),
             "*update.googleapis.com*".to_string(),
             "*safebrowsing.googleapis.com*".to_string(),
-            "*clients1.google.com*".to_string(),
-            "*clients2.google.com*".to_string(),
-            "*clients3.google.com*".to_string(),
-            "*clients4.google.com*".to_string(),
-            "*clients5.google.com*".to_string(),
-            "*clients6.google.com*".to_string(),
             // Video embeds (heavy bandwidth)
             "*.youtube.com/embed/*".to_string(),
             "*.vimeo.com/*".to_string(),

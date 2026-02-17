@@ -9,20 +9,32 @@
 //! 3. Tunnels traffic transparently between Chrome and target
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tracing::{info, debug, warn, error};
 use base64::Engine;
 
-/// Global port counter for allocating unique local ports
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(18080);
+/// Port range for local proxy forwarders (18080..48080)
+const PORT_BASE: u32 = 18080;
+const PORT_RANGE: u32 = 30000;
 
-/// Allocate a unique local port for a proxy forwarder
+/// Global port counter for allocating unique local ports
+static PORT_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate a unique local port for a proxy forwarder.
+/// Wraps around within the range 18080..48080 to avoid overflow.
 pub fn allocate_port() -> u16 {
-    PORT_COUNTER.fetch_add(1, Ordering::Relaxed)
+    let offset = PORT_COUNTER.fetch_add(1, Ordering::Relaxed) % PORT_RANGE;
+    (PORT_BASE + offset) as u16
 }
+
+/// Max number of headers to read from a single request/response
+const MAX_HEADERS: usize = 100;
+/// Max size of a single header line (8KB)
+const MAX_HEADER_LINE: usize = 8192;
 
 /// Local proxy forwarder that handles authentication to upstream proxy
 pub struct LocalProxyForwarder {
@@ -91,15 +103,8 @@ impl LocalProxyForwarder {
     fn auth_header(&self) -> String {
         let credentials = format!("{}:{}", self.username, self.password);
         let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
-        // Log auth info (mask most of the password)
-        let pass_preview = if self.password.len() > 4 {
-            format!("{}...{}", &self.password[..2], &self.password[self.password.len()-2..])
-        } else {
-            "****".to_string()
-        };
-        info!("Auth for user '{}', pass: '{}' (len={})",
+        info!("Auth for user '{}', pass_len: {}",
                crate::safe_truncate(&self.username, 40),
-               pass_preview,
                self.password.len());
         format!("Basic {}", encoded)
     }
@@ -212,13 +217,16 @@ async fn handle_connection(
     let method = parts[0];
     let target = parts[1];
 
-    // Read all headers
+    // Read all headers (bounded to prevent memory exhaustion)
     let mut headers = Vec::new();
-    loop {
-        let mut line = String::new();
+    for _ in 0..MAX_HEADERS {
+        let mut line = String::with_capacity(256);
         let n = client.read_line(&mut line).await?;
         if n == 0 || line == "\r\n" || line == "\n" {
             break;
+        }
+        if line.len() > MAX_HEADER_LINE {
+            return Err("Header line too long".into());
         }
         headers.push(line);
     }
@@ -234,7 +242,7 @@ async fn handle_connection(
 
 /// Handle CONNECT request (HTTPS tunneling)
 async fn handle_connect(
-    mut client: BufReader<TcpStream>,
+    client: BufReader<TcpStream>,
     target: &str,
     upstream_host: &str,
     upstream_port: u16,
@@ -243,13 +251,7 @@ async fn handle_connect(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug!("CONNECT tunnel to {} via {}:{}", target, upstream_host, upstream_port);
 
-    // Connect to upstream proxy
     let upstream_addr = format!("{}:{}", upstream_host, upstream_port);
-    let mut upstream = TcpStream::connect(&upstream_addr).await
-        .map_err(|e| format!("Failed to connect to upstream proxy {}: {}", upstream_addr, e))?;
-
-    // Send CONNECT request to upstream with authentication
-    // Include all headers that Oxylabs might expect
     let connect_request = format!(
         "{}\r\nHost: {}\r\nProxy-Authorization: {}\r\nProxy-Connection: keep-alive\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n\r\n",
         request_line.trim(),
@@ -259,49 +261,103 @@ async fn handle_connect(
 
     info!("CONNECT to upstream: {} -> {}", target, upstream_host);
 
-    debug!("Sending to upstream: {}", connect_request.lines().next().unwrap_or(""));
-    upstream.write_all(connect_request.as_bytes()).await?;
-    upstream.flush().await?;
+    // Retry loop for transient upstream errors (e.g. Oxylabs 522 timeouts)
+    let max_retries = 2u32;
+    let mut upstream: Option<TcpStream> = None;
+    let mut last_error_response = String::new();
+    let mut last_error_headers: Vec<String> = Vec::new();
 
-    // Read response from upstream proxy
-    let mut upstream_reader = BufReader::new(&mut upstream);
-    let mut response_line = String::new();
-    upstream_reader.read_line(&mut response_line).await?;
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            let backoff_ms = if attempt == 1 { 200 } else { 400 };
+            warn!("CONNECT retry {}/{} for {} after {}ms backoff", attempt, max_retries, target, backoff_ms);
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
 
-    debug!("Upstream proxy response: {}", response_line.trim());
+        // Connect to upstream proxy with timeout
+        let mut conn = match tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(&upstream_addr)
+        ).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                warn!("CONNECT attempt {} failed to connect: {}", attempt + 1, e);
+                continue;
+            }
+            Err(_) => {
+                warn!("CONNECT attempt {} timed out connecting to {}", attempt + 1, upstream_addr);
+                continue;
+            }
+        };
 
-    // Read remaining response headers
-    let mut response_headers = Vec::new();
-    loop {
-        let mut line = String::new();
-        let n = upstream_reader.read_line(&mut line).await?;
-        if n == 0 || line == "\r\n" || line == "\n" {
+        debug!("Sending to upstream: {}", connect_request.lines().next().unwrap_or(""));
+        if conn.write_all(connect_request.as_bytes()).await.is_err() { continue; }
+        if conn.flush().await.is_err() { continue; }
+
+        // Read response from upstream proxy
+        let mut upstream_reader = BufReader::new(&mut conn);
+        let mut response_line = String::new();
+        if upstream_reader.read_line(&mut response_line).await.is_err() { continue; }
+
+        debug!("Upstream proxy response: {}", response_line.trim());
+
+        // Read remaining response headers (bounded)
+        let mut response_headers = Vec::new();
+        let mut header_err = false;
+        for _ in 0..MAX_HEADERS {
+            let mut line = String::with_capacity(256);
+            match upstream_reader.read_line(&mut line).await {
+                Ok(n) => {
+                    if n == 0 || line == "\r\n" || line == "\n" { break; }
+                    if line.len() > MAX_HEADER_LINE { header_err = true; break; }
+                    response_headers.push(line);
+                }
+                Err(_) => { header_err = true; break; }
+            }
+        }
+        if header_err { continue; }
+
+        if response_line.contains("200") {
+            // Success — use this connection
+            upstream = Some(conn);
             break;
         }
-        response_headers.push(line);
-    }
 
-    // Check if connection was established (200 response)
-    if !response_line.contains("200") {
-        // Log the full error response
+        // Check if this is a retryable error (522 = Oxylabs timeout)
+        let is_522 = response_line.contains("522");
+        if is_522 && attempt < max_retries {
+            warn!("Proxy CONNECT got 522 (attempt {}), will retry: {}", attempt + 1, response_line.trim());
+            drop(conn); // Close the failed connection
+            continue;
+        }
+
+        // Non-retryable error or final attempt — save for forwarding to client
         error!("Proxy CONNECT failed: {}", response_line.trim());
         for h in &response_headers {
             error!("  Response header: {}", h.trim());
         }
-
-        // Get the inner client stream
-        let mut client_stream = client.into_inner();
-
-        // Forward error response to client
-        client_stream.write_all(response_line.as_bytes()).await?;
-        for header in &response_headers {
-            client_stream.write_all(header.as_bytes()).await?;
-        }
-        client_stream.write_all(b"\r\n").await?;
-        client_stream.flush().await?;
-
-        return Err(format!("Upstream proxy rejected CONNECT: {}", response_line.trim()).into());
+        last_error_response = response_line;
+        last_error_headers = response_headers;
+        break;
     }
+
+    // If we didn't get a successful upstream connection, forward the error to client
+    let upstream = match upstream {
+        Some(u) => u,
+        None => {
+            let mut client_stream = client.into_inner();
+            if !last_error_response.is_empty() {
+                client_stream.write_all(last_error_response.as_bytes()).await?;
+                for header in &last_error_headers {
+                    client_stream.write_all(header.as_bytes()).await?;
+                }
+                client_stream.write_all(b"\r\n").await?;
+                client_stream.flush().await?;
+                return Err(format!("Upstream proxy rejected CONNECT: {}", last_error_response.trim()).into());
+            }
+            return Err(format!("Failed to establish CONNECT tunnel to {} after {} retries", target, max_retries).into());
+        }
+    };
 
     // Send 200 Connection Established to client
     let mut client_stream = client.into_inner();
@@ -315,7 +371,7 @@ async fn handle_connect(
     let (mut upstream_read, mut upstream_write) = upstream.into_split();
 
     // Copy data in both directions concurrently
-    let client_to_upstream = tokio::spawn(async move {
+    let mut client_to_upstream = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
             match client_read.read(&mut buf).await {
@@ -333,7 +389,7 @@ async fn handle_connect(
         }
     });
 
-    let upstream_to_client = tokio::spawn(async move {
+    let mut upstream_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
             match upstream_read.read(&mut buf).await {
@@ -351,10 +407,17 @@ async fn handle_connect(
         }
     });
 
-    // Wait for either direction to complete (connection closed)
+    // Wait for either direction to complete, then abort the other
+    // Add small delay after abort to let Windows flush/close sockets cleanly
     tokio::select! {
-        _ = client_to_upstream => {},
-        _ = upstream_to_client => {},
+        _ = &mut client_to_upstream => {
+            upstream_to_client.abort();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        },
+        _ = &mut upstream_to_client => {
+            client_to_upstream.abort();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        },
     }
 
     debug!("CONNECT tunnel closed for {}", target);
@@ -372,9 +435,13 @@ async fn handle_http(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug!("HTTP request: {}", request_line.trim());
 
-    // Connect to upstream proxy
+    // Connect to upstream proxy with timeout
     let upstream_addr = format!("{}:{}", upstream_host, upstream_port);
-    let mut upstream = TcpStream::connect(&upstream_addr).await
+    let mut upstream = tokio::time::timeout(
+        Duration::from_secs(10),
+        TcpStream::connect(&upstream_addr)
+    ).await
+        .map_err(|_| format!("Timeout connecting to upstream proxy {}", upstream_addr))?
         .map_err(|e| format!("Failed to connect to upstream proxy {}: {}", upstream_addr, e))?;
 
     // Build request with Proxy-Authorization header
@@ -392,13 +459,13 @@ async fn handle_http(
     upstream.flush().await?;
 
     // Get inner streams
-    let mut client_stream = client.into_inner();
+    let client_stream = client.into_inner();
 
     // Tunnel remaining data bidirectionally
     let (mut client_read, mut client_write) = client_stream.into_split();
     let (mut upstream_read, mut upstream_write) = upstream.into_split();
 
-    let client_to_upstream = tokio::spawn(async move {
+    let mut client_to_upstream = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
             match client_read.read(&mut buf).await {
@@ -413,7 +480,7 @@ async fn handle_http(
         }
     });
 
-    let upstream_to_client = tokio::spawn(async move {
+    let mut upstream_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
             match upstream_read.read(&mut buf).await {
@@ -428,9 +495,16 @@ async fn handle_http(
         }
     });
 
+    // Add small delay after abort to let Windows flush/close sockets cleanly
     tokio::select! {
-        _ = client_to_upstream => {},
-        _ = upstream_to_client => {},
+        _ = &mut client_to_upstream => {
+            upstream_to_client.abort();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        },
+        _ = &mut upstream_to_client => {
+            client_to_upstream.abort();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        },
     }
 
     Ok(())
