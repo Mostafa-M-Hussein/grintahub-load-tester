@@ -1583,6 +1583,9 @@ impl BrowserActions {
         session.click_human_at(x, y).await?;
 
         let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, 12).await;
+        // Track consecutive network errors — if target is unreachable through proxy,
+        // skip slow middle methods and jump to fast fallbacks
+        let mut consecutive_net_errors: u32 = 0;
         if nav && !is_err && !net_err {
             info!("Session {} METHOD 1 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
             return Ok(true);
@@ -1592,16 +1595,31 @@ impl BrowserActions {
             return Ok(true);
         } else if net_err {
             warn!("Session {} METHOD 1 network error but Google tracking NOT verified — not counting", session.id);
+            consecutive_net_errors += 1;
         }
         if is_err { go_back(session).await; }
 
         // ================================================================
+        // FAST PATH: If METHOD 1 had a network error (proxy can't reach target),
+        // skip slow middle methods (2-5) and jump directly to anchor clone click.
+        // When the proxy returns 522 for the target domain, all CDP/JS click methods
+        // will fail identically — no point waiting 4+ minutes.
+        // ================================================================
+        if consecutive_net_errors > 0 {
+            warn!("Session {} METHOD 1 had network error — skipping to fast fallback (METHOD 6: anchor clone)", session.id);
+        }
+
+        // ================================================================
         // METHOD 2: CDP click at FRESH coordinates (element may have shifted)
+        // SKIPPED when proxy can't reach target (network error detected)
         // ================================================================
         if !session.is_alive() {
             warn!("Session {} CDP connection dead before METHOD 2, bailing", session.id);
             return Ok(false);
         }
+        if consecutive_net_errors > 0 {
+            warn!("Session {} skipping METHOD 2-5 (proxy can't reach target) — jumping to anchor clone", session.id);
+        } else {
         warn!("Session {} METHOD 1 failed, trying METHOD 2: CDP fresh-coord click", session.id);
         let fresh_coords = session.execute_js(r#"
             (function() {
@@ -1635,18 +1653,24 @@ impl BrowserActions {
                     return Ok(true);
                 } else if net_err {
                     warn!("Session {} METHOD 2 network error but Google tracking NOT verified", session.id);
+                    consecutive_net_errors += 1;
                 }
                 if is_err { go_back(session).await; }
             }
         }
+        } // end of else (skip when net_err)
 
         // ================================================================
         // METHOD 3: JS full mouse event sequence + native .click()
+        // SKIPPED when proxy can't reach target (consecutive network errors)
         // ================================================================
         if !session.is_alive() {
             warn!("Session {} CDP connection dead before METHOD 3, bailing", session.id);
             return Ok(false);
         }
+        if consecutive_net_errors > 0 {
+            // Skip — proxy can't reach target
+        } else {
         warn!("Session {} METHOD 2 failed, trying METHOD 3: JS mouse events + .click()", session.id);
         let js_result = session.execute_js(&format!(r#"
             (async function() {{
@@ -1711,6 +1735,7 @@ impl BrowserActions {
                 return Ok(true);
             } else if net_err {
                 warn!("Session {} METHOD 3 network error but Google tracking NOT verified", session.id);
+                consecutive_net_errors += 1;
             }
             if is_err { go_back(session).await; }
         } else {
@@ -1719,14 +1744,19 @@ impl BrowserActions {
                 .and_then(|v| v.as_str()).unwrap_or("unknown");
             warn!("Session {} METHOD 3 element not found: {}", session.id, reason);
         }
+        } // end of else (skip when net_err)
 
         // ================================================================
         // METHOD 4: Focus element + CDP Enter keypress
+        // SKIPPED when proxy can't reach target (consecutive network errors)
         // ================================================================
         if !session.is_alive() {
             warn!("Session {} CDP connection dead before METHOD 4, bailing", session.id);
             return Ok(false);
         }
+        if consecutive_net_errors > 0 {
+            // Skip — proxy can't reach target
+        } else {
         warn!("Session {} METHOD 3 failed, trying METHOD 4: Focus + Enter key", session.id);
         let focus_result = session.execute_js(&format!(r#"
             (function() {{
@@ -1784,19 +1814,23 @@ impl BrowserActions {
                 return Ok(true);
             } else if net_err {
                 warn!("Session {} METHOD 4 network error but Google tracking NOT verified", session.id);
+                consecutive_net_errors += 1;
             }
             if is_err { go_back(session).await; }
         }
+        } // end of else (skip METHOD 4 when net_err)
 
         // ================================================================
         // METHOD 5: JS window.location.href = ad URL
+        // SKIPPED when proxy can't reach target (consecutive network errors)
         // ================================================================
-        let ad_href = focus_result.as_ref()
-            .and_then(|v| v.get("href"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(href);
+        // Use the original href for remaining methods.
+        // (focus_result from METHOD 4 is only available when METHOD 4 ran)
+        let ad_href = href;
 
-        if !ad_href.is_empty() && session.is_alive() {
+        if consecutive_net_errors > 0 {
+            // Skip — proxy can't reach target
+        } else if !ad_href.is_empty() && session.is_alive() {
             warn!("Session {} METHOD 4 failed, trying METHOD 5: window.location.href", session.id);
             session.execute_js(&format!(
                 "window.location.href = {};",
@@ -1813,15 +1847,21 @@ impl BrowserActions {
                 return Ok(true);
             } else if net_err {
                 warn!("Session {} METHOD 5 network error but Google tracking NOT verified", session.id);
+                consecutive_net_errors += 1;
             }
             if is_err { go_back(session).await; }
         }
 
         // ================================================================
         // METHOD 6: Create hidden anchor + .click() (bypasses event listeners)
+        // This is the FAST FALLBACK — always tried, even after network errors.
         // ================================================================
         if !ad_href.is_empty() && session.is_alive() {
-            warn!("Session {} METHOD 5 failed, trying METHOD 6: anchor clone click", session.id);
+            if consecutive_net_errors > 0 {
+                warn!("Session {} trying METHOD 6 (fast fallback after network errors): anchor clone click", session.id);
+            } else {
+                warn!("Session {} METHOD 5 failed, trying METHOD 6: anchor clone click", session.id);
+            }
             let href_json = serde_json::to_string(ad_href).unwrap_or_else(|_| format!("\"{}\"", ad_href));
             session.execute_js(&format!(r#"
                 (function() {{
@@ -1837,7 +1877,8 @@ impl BrowserActions {
                 }})()
             "#, href_json)).await.ok();
 
-            let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, 12).await;
+            let m6_polls = if consecutive_net_errors > 0 { 6 } else { 10 };
+            let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, m6_polls).await;
             if nav && !is_err && !net_err {
                 info!("Session {} METHOD 6 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
                 return Ok(true);
@@ -1847,19 +1888,23 @@ impl BrowserActions {
                 return Ok(true);
             } else if net_err {
                 warn!("Session {} METHOD 6 network error but Google tracking NOT verified", session.id);
+                consecutive_net_errors += 1;
             }
             if is_err { go_back(session).await; }
         }
 
         // ================================================================
         // METHOD 7: Direct navigation via session.navigate() (last resort)
+        // SKIPPED if 2+ consecutive network errors (proxy definitely can't reach target)
         // ================================================================
-        if !ad_href.is_empty() && session.is_alive() {
+        if consecutive_net_errors >= 2 {
+            warn!("Session {} skipping METHOD 7 — {} consecutive network errors, proxy can't reach target", session.id, consecutive_net_errors);
+        } else if !ad_href.is_empty() && session.is_alive() {
             warn!("Session {} METHOD 6 failed, trying METHOD 7: direct navigate()", session.id);
             let nav_result = session.navigate(ad_href).await;
             match nav_result {
                 Ok(_) => {
-                    let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, 12).await;
+                    let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, 6).await;
                     if nav && !is_err && !net_err {
                         info!("Session {} METHOD 7 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
                         return Ok(true);
