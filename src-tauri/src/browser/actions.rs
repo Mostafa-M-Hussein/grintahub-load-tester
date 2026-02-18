@@ -1493,6 +1493,32 @@ impl BrowserActions {
             tokio::time::sleep(Duration::from_millis(2000)).await;
         }
 
+        // Helper: verify Google ad tracking was actually hit by checking browser's
+        // performance entries. Returns true if any request to googleadservices.com,
+        // doubleclick.net, or Google's ad redirect endpoints was made.
+        async fn verify_google_tracked(session: &Arc<BrowserSession>) -> bool {
+            let result = session.execute_js_with_timeout(r#"
+                (function() {
+                    try {
+                        var dominated = ['googleadservices.com', 'googlesyndication.com', 'doubleclick.net'];
+                        // Check resource timing entries (captures all HTTP requests)
+                        var entries = performance.getEntriesByType('resource')
+                            .concat(performance.getEntriesByType('navigation'));
+                        for (var i = 0; i < entries.length; i++) {
+                            var url = (entries[i].name || '').toLowerCase();
+                            for (var j = 0; j < dominated.length; j++) {
+                                if (url.indexOf(dominated[j]) !== -1) return true;
+                            }
+                            // Also check clients*.google.com (ad redirect intermediary)
+                            if (url.indexOf('clients') !== -1 && url.indexOf('google.com') !== -1) return true;
+                        }
+                        return false;
+                    } catch(e) { return false; }
+                })()
+            "#, 3).await;
+            result.ok().and_then(|v| v.as_bool()).unwrap_or(false)
+        }
+
         // ================================================================
         // PRE-CLICK BEHAVIOR: Hover over other results first (anti-detection)
         // Real users scan multiple results before deciding which to click
@@ -1561,9 +1587,11 @@ impl BrowserActions {
             info!("Session {} METHOD 1 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
             return Ok(true);
         }
-        if net_err {
-            info!("Session {} METHOD 1 click navigated but target unreachable — counting as success (Google tracked the click)", session.id);
+        if net_err && verify_google_tracked(session).await {
+            info!("Session {} METHOD 1 click navigated, target unreachable, Google tracking VERIFIED [CLICK COUNTED]", session.id);
             return Ok(true);
+        } else if net_err {
+            warn!("Session {} METHOD 1 network error but Google tracking NOT verified — not counting", session.id);
         }
         if is_err { go_back(session).await; }
 
@@ -1602,9 +1630,11 @@ impl BrowserActions {
                     info!("Session {} METHOD 2 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
                     return Ok(true);
                 }
-                if net_err {
-                    info!("Session {} METHOD 2 click navigated but target unreachable — counting as success", session.id);
+                if net_err && verify_google_tracked(session).await {
+                    info!("Session {} METHOD 2 click navigated, target unreachable, Google tracking VERIFIED [CLICK COUNTED]", session.id);
                     return Ok(true);
+                } else if net_err {
+                    warn!("Session {} METHOD 2 network error but Google tracking NOT verified", session.id);
                 }
                 if is_err { go_back(session).await; }
             }
@@ -1676,9 +1706,11 @@ impl BrowserActions {
                 info!("Session {} METHOD 3 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
                 return Ok(true);
             }
-            if net_err {
-                info!("Session {} METHOD 3 click navigated but target unreachable — counting as success", session.id);
+            if net_err && verify_google_tracked(session).await {
+                info!("Session {} METHOD 3 click navigated, target unreachable, Google tracking VERIFIED [CLICK COUNTED]", session.id);
                 return Ok(true);
+            } else if net_err {
+                warn!("Session {} METHOD 3 network error but Google tracking NOT verified", session.id);
             }
             if is_err { go_back(session).await; }
         } else {
@@ -1747,9 +1779,11 @@ impl BrowserActions {
                 info!("Session {} METHOD 4 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
                 return Ok(true);
             }
-            if net_err {
-                info!("Session {} METHOD 4 click navigated but target unreachable — counting as success", session.id);
+            if net_err && verify_google_tracked(session).await {
+                info!("Session {} METHOD 4 click navigated, target unreachable, Google tracking VERIFIED [CLICK COUNTED]", session.id);
                 return Ok(true);
+            } else if net_err {
+                warn!("Session {} METHOD 4 network error but Google tracking NOT verified", session.id);
             }
             if is_err { go_back(session).await; }
         }
@@ -1774,9 +1808,11 @@ impl BrowserActions {
                 info!("Session {} METHOD 5 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
                 return Ok(true);
             }
-            if net_err {
-                info!("Session {} METHOD 5 click navigated but target unreachable — counting as success", session.id);
+            if net_err && verify_google_tracked(session).await {
+                info!("Session {} METHOD 5 click navigated, target unreachable, Google tracking VERIFIED [CLICK COUNTED]", session.id);
                 return Ok(true);
+            } else if net_err {
+                warn!("Session {} METHOD 5 network error but Google tracking NOT verified", session.id);
             }
             if is_err { go_back(session).await; }
         }
@@ -1806,9 +1842,11 @@ impl BrowserActions {
                 info!("Session {} METHOD 6 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
                 return Ok(true);
             }
-            if net_err {
-                info!("Session {} METHOD 6 click navigated but target unreachable — counting as success", session.id);
+            if net_err && verify_google_tracked(session).await {
+                info!("Session {} METHOD 6 click navigated, target unreachable, Google tracking VERIFIED [CLICK COUNTED]", session.id);
                 return Ok(true);
+            } else if net_err {
+                warn!("Session {} METHOD 6 network error but Google tracking NOT verified", session.id);
             }
             if is_err { go_back(session).await; }
         }
@@ -1826,9 +1864,11 @@ impl BrowserActions {
                         info!("Session {} METHOD 7 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
                         return Ok(true);
                     }
-                    if net_err {
-                        info!("Session {} METHOD 7 click navigated but target unreachable — counting as success", session.id);
+                    if net_err && verify_google_tracked(session).await {
+                        info!("Session {} METHOD 7 click navigated, target unreachable, Google tracking VERIFIED [CLICK COUNTED]", session.id);
                         return Ok(true);
+                    } else if net_err {
+                        warn!("Session {} METHOD 7 network error but Google tracking NOT verified", session.id);
                     }
                     if is_err {
                         warn!("Session {} METHOD 7 error page: {}", session.id, safe_truncate(&url_after, 60));
@@ -2357,23 +2397,44 @@ impl BrowserActions {
                     redirect_chain.iter().map(|u| safe_truncate(u, 50)).collect::<Vec<_>>().join(" -> "));
             }
 
-            // Handle error pages and unconfirmed landings.
-            // We're inside `if clicked { ... }` — click_target_ad() only returns true when:
-            //   1. A verified Google Ad element was found and clicked
-            //   2. Navigation was triggered (URL changed OR network error detected)
-            // Google tracks clicks at googleadservices.com (first redirect hop), which always
-            // succeeds even if the final target is unreachable through proxy. So if we got
-            // here with an error page, the click IS already billed by Google.
+            // Handle error pages: verify Google actually tracked the click before counting.
+            // Check performance entries for requests to googleadservices.com / doubleclick.net.
             if let Some(ref error) = last_error {
                 if !landed_on_target {
-                    // Error page detected — target unreachable but Google already tracked the click
-                    landed_on_target = true;
-                    session.increment_clicks();
-                    if let Some(s) = stats {
-                        s.record_click(0);
+                    // Verify Google's ad tracking was actually hit
+                    let google_verified = {
+                        let check = session.execute_js_with_timeout(r#"
+                            (function() {
+                                try {
+                                    var dominated = ['googleadservices.com', 'googlesyndication.com', 'doubleclick.net'];
+                                    var entries = performance.getEntriesByType('resource')
+                                        .concat(performance.getEntriesByType('navigation'));
+                                    for (var i = 0; i < entries.length; i++) {
+                                        var url = (entries[i].name || '').toLowerCase();
+                                        for (var j = 0; j < dominated.length; j++) {
+                                            if (url.indexOf(dominated[j]) !== -1) return true;
+                                        }
+                                        if (url.indexOf('clients') !== -1 && url.indexOf('google.com') !== -1) return true;
+                                    }
+                                    return false;
+                                } catch(e) { return false; }
+                            })()
+                        "#, 3).await;
+                        check.ok().and_then(|v| v.as_bool()).unwrap_or(false)
+                    };
+
+                    if google_verified {
+                        landed_on_target = true;
+                        session.increment_clicks();
+                        if let Some(s) = stats {
+                            s.record_click(0);
+                        }
+                        info!("Session {} AD CLICK COUNTED — target unreachable but Google tracking VERIFIED: {} [CLICK COUNTED]",
+                            session.id, error);
+                    } else {
+                        warn!("Session {} error page detected and Google tracking NOT verified — not counting: {}", session.id, error);
+                        return Ok(false);
                     }
-                    info!("Session {} AD CLICK COUNTED — ad clicked, redirect started, but target unreachable: {} [CLICK COUNTED]",
-                        session.id, error);
                 }
             }
 
