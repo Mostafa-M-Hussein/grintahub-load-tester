@@ -1413,7 +1413,9 @@ impl BrowserActions {
         // Helper: poll for navigation (URL change is sufficient — don't wait for readyState)
         // Uses both JS and CDP-level URL check. CDP works even when page is stuck loading
         // (e.g., target site unreachable through proxy — JS hangs but CDP still reports the URL).
-        async fn poll_navigation(session: &Arc<BrowserSession>, url_before: &str, max_polls: u32) -> (bool, String, bool) {
+        // Returns (navigated, url_after, is_error, is_network_error)
+        // is_network_error = true means Chrome navigated but target was unreachable (ERR_TIMED_OUT etc.)
+        async fn poll_navigation(session: &Arc<BrowserSession>, url_before: &str, max_polls: u32) -> (bool, String, bool, bool) {
             let mut url_after = String::new();
             let mut navigated = false;
             for poll in 0..max_polls {
@@ -1446,10 +1448,43 @@ impl BrowserActions {
                     }
                 }
             }
+
+            // Check for Chrome error page URLs
             let is_error = url_after.starts_with("chrome-error://")
                 || url_after.starts_with("about:")
                 || url_after.starts_with("chrome://");
-            (navigated, url_after, is_error)
+
+            // If no URL change detected, check if Chrome is showing a network error page
+            // (e.g., ERR_TIMED_OUT, ERR_CONNECTION_RESET). The URL stays the same but
+            // document.title contains the error code — meaning navigation was attempted.
+            let mut is_network_error = false;
+            if !navigated {
+                let err_check = session.execute_js_with_timeout(
+                    r#"({
+                        title: document.title || '',
+                        bodyText: (document.body && document.body.innerText || '').substring(0, 500)
+                    })"#,
+                    3
+                ).await;
+                if let Ok(v) = &err_check {
+                    let title = v.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    let body = v.get("bodyText").and_then(|v| v.as_str()).unwrap_or("");
+                    let combined = format!("{} {}", title, body);
+                    let error_indicators = [
+                        "ERR_TIMED_OUT", "ERR_CONNECTION_RESET", "ERR_CONNECTION_REFUSED",
+                        "ERR_CONNECTION_CLOSED", "ERR_PROXY_CONNECTION_FAILED",
+                        "ERR_TUNNEL_CONNECTION_FAILED", "ERR_NAME_NOT_RESOLVED",
+                        "ERR_SSL_PROTOCOL_ERROR", "ERR_CONNECTION_TIMED_OUT",
+                    ];
+                    if error_indicators.iter().any(|e| combined.contains(e)) {
+                        is_network_error = true;
+                        navigated = true; // Click did trigger navigation, target just unreachable
+                        debug!("Network error page detected (title: '{}') — click navigated but target unreachable", title);
+                    }
+                }
+            }
+
+            (navigated, url_after, is_error, is_network_error)
         }
 
         // Helper: go back to search page after error
@@ -1521,9 +1556,13 @@ impl BrowserActions {
         }
         session.click_human_at(x, y).await?;
 
-        let (nav, url_after, is_err) = poll_navigation(session, &url_before, 12).await;
-        if nav && !is_err {
+        let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, 12).await;
+        if nav && !is_err && !net_err {
             info!("Session {} METHOD 1 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+            return Ok(true);
+        }
+        if net_err {
+            info!("Session {} METHOD 1 click navigated but target unreachable — counting as success (Google tracked the click)", session.id);
             return Ok(true);
         }
         if is_err { go_back(session).await; }
@@ -1558,9 +1597,13 @@ impl BrowserActions {
                 Self::random_delay(200, 400).await;
                 session.click_human_at(fx, fy).await?;
 
-                let (nav, url_after, is_err) = poll_navigation(session, &url_before, 10).await;
-                if nav && !is_err {
+                let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, 10).await;
+                if nav && !is_err && !net_err {
                     info!("Session {} METHOD 2 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+                    return Ok(true);
+                }
+                if net_err {
+                    info!("Session {} METHOD 2 click navigated but target unreachable — counting as success", session.id);
                     return Ok(true);
                 }
                 if is_err { go_back(session).await; }
@@ -1628,9 +1671,13 @@ impl BrowserActions {
             .and_then(|v| v.as_bool()).unwrap_or(false);
 
         if js_clicked {
-            let (nav, url_after, is_err) = poll_navigation(session, &url_before, 10).await;
-            if nav && !is_err {
+            let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, 10).await;
+            if nav && !is_err && !net_err {
                 info!("Session {} METHOD 3 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+                return Ok(true);
+            }
+            if net_err {
+                info!("Session {} METHOD 3 click navigated but target unreachable — counting as success", session.id);
                 return Ok(true);
             }
             if is_err { go_back(session).await; }
@@ -1695,9 +1742,13 @@ impl BrowserActions {
                 );
             "#).await.ok();
 
-            let (nav, url_after, is_err) = poll_navigation(session, &url_before, 10).await;
-            if nav && !is_err {
+            let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, 10).await;
+            if nav && !is_err && !net_err {
                 info!("Session {} METHOD 4 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+                return Ok(true);
+            }
+            if net_err {
+                info!("Session {} METHOD 4 click navigated but target unreachable — counting as success", session.id);
                 return Ok(true);
             }
             if is_err { go_back(session).await; }
@@ -1718,9 +1769,13 @@ impl BrowserActions {
                 serde_json::to_string(ad_href).unwrap_or_else(|_| format!("\"{}\"", ad_href))
             )).await.ok();
 
-            let (nav, url_after, is_err) = poll_navigation(session, &url_before, 12).await;
-            if nav && !is_err {
+            let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, 12).await;
+            if nav && !is_err && !net_err {
                 info!("Session {} METHOD 5 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+                return Ok(true);
+            }
+            if net_err {
+                info!("Session {} METHOD 5 click navigated but target unreachable — counting as success", session.id);
                 return Ok(true);
             }
             if is_err { go_back(session).await; }
@@ -1746,9 +1801,13 @@ impl BrowserActions {
                 }})()
             "#, href_json)).await.ok();
 
-            let (nav, url_after, is_err) = poll_navigation(session, &url_before, 12).await;
-            if nav && !is_err {
+            let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, 12).await;
+            if nav && !is_err && !net_err {
                 info!("Session {} METHOD 6 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+                return Ok(true);
+            }
+            if net_err {
+                info!("Session {} METHOD 6 click navigated but target unreachable — counting as success", session.id);
                 return Ok(true);
             }
             if is_err { go_back(session).await; }
@@ -1762,9 +1821,13 @@ impl BrowserActions {
             let nav_result = session.navigate(ad_href).await;
             match nav_result {
                 Ok(_) => {
-                    let (nav, url_after, is_err) = poll_navigation(session, &url_before, 12).await;
-                    if nav && !is_err {
+                    let (nav, url_after, is_err, net_err) = poll_navigation(session, &url_before, 12).await;
+                    if nav && !is_err && !net_err {
                         info!("Session {} METHOD 7 SUCCESS -> {}", session.id, safe_truncate(&url_after, 80));
+                        return Ok(true);
+                    }
+                    if net_err {
+                        info!("Session {} METHOD 7 click navigated but target unreachable — counting as success", session.id);
                         return Ok(true);
                     }
                     if is_err {
@@ -2294,17 +2357,29 @@ impl BrowserActions {
                     redirect_chain.iter().map(|u| safe_truncate(u, 50)).collect::<Vec<_>>().join(" -> "));
             }
 
-            // Handle explicit errors
-            if let Some(error) = last_error {
-                warn!("Session {} click failed due to redirect error: {}", session.id, error);
-                return Ok(false);
+            // Handle error pages and unconfirmed landings.
+            // We're inside `if clicked { ... }` — click_target_ad() only returns true when:
+            //   1. A verified Google Ad element was found and clicked
+            //   2. Navigation was triggered (URL changed OR network error detected)
+            // Google tracks clicks at googleadservices.com (first redirect hop), which always
+            // succeeds even if the final target is unreachable through proxy. So if we got
+            // here with an error page, the click IS already billed by Google.
+            if let Some(ref error) = last_error {
+                if !landed_on_target {
+                    // Error page detected — target unreachable but Google already tracked the click
+                    landed_on_target = true;
+                    session.increment_clicks();
+                    if let Some(s) = stats {
+                        s.record_click(0);
+                    }
+                    info!("Session {} AD CLICK COUNTED — ad clicked, redirect started, but target unreachable: {} [CLICK COUNTED]",
+                        session.id, error);
+                }
             }
 
-            // Stricter verification: only count clicks with confirmed landing
-            // This prevents counting clicks that didn't actually reach the target
+            // Stricter verification: only count clicks with confirmed landing or confirmed error
             if !landed_on_target {
                 warn!("Session {} click happened but landing NOT confirmed - NOT counting (stricter verification)", session.id);
-                // Don't count the click - return false to indicate no verified click
                 return Ok(false);
             }
 

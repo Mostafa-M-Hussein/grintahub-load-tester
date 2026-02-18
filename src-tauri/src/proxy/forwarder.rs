@@ -263,7 +263,7 @@ async fn handle_connect(
 
     let upstream_addr = format!("{}:{}", upstream_host, upstream_port);
     let connect_request = format!(
-        "{}\r\nHost: {}\r\nProxy-Authorization: {}\r\nProxy-Connection: keep-alive\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n\r\n",
+        "{}\r\nHost: {}\r\nProxy-Authorization: {}\r\nProxy-Connection: keep-alive\r\n\r\n",
         request_line.trim(),
         target,
         auth_header
@@ -271,10 +271,10 @@ async fn handle_connect(
 
     info!("CONNECT to upstream: {} -> {}", target, upstream_host);
 
-    // Ad domains need longer timeouts and more retries (Oxylabs often slow for these)
+    // All domains get robust retry/timeout; ad domains get even more
     let is_ad = is_ad_domain(target);
-    let max_retries = if is_ad { 4u32 } else { 2u32 };
-    let connect_timeout = if is_ad { 30u64 } else { 10u64 };
+    let max_retries = if is_ad { 4u32 } else { 4u32 };
+    let connect_timeout = if is_ad { 30u64 } else { 20u64 };
 
     if is_ad {
         debug!("Ad domain detected: {} - using extended timeout ({}s) and {} retries",
@@ -460,14 +460,25 @@ async fn handle_http(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug!("HTTP request: {}", request_line.trim());
 
-    // Connect to upstream proxy with timeout
+    // Connect to upstream proxy with timeout and retries (matches CONNECT path)
     let upstream_addr = format!("{}:{}", upstream_host, upstream_port);
-    let mut upstream = tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect(&upstream_addr)
-    ).await
-        .map_err(|_| format!("Timeout connecting to upstream proxy {}", upstream_addr))?
-        .map_err(|e| format!("Failed to connect to upstream proxy {}: {}", upstream_addr, e))?;
+    let mut upstream: Option<TcpStream> = None;
+    for attempt in 0..=3u32 {
+        if attempt > 0 {
+            let backoff_ms = match attempt { 1 => 200, 2 => 500, _ => 1000 };
+            warn!("HTTP upstream retry {}/3 for {} after {}ms", attempt, upstream_addr, backoff_ms);
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            TcpStream::connect(&upstream_addr)
+        ).await {
+            Ok(Ok(c)) => { upstream = Some(c); break; }
+            Ok(Err(e)) => { warn!("HTTP upstream attempt {} connect error: {}", attempt + 1, e); }
+            Err(_) => { warn!("HTTP upstream attempt {} timed out", attempt + 1); }
+        }
+    }
+    let mut upstream = upstream.ok_or_else(|| format!("Failed to connect to upstream proxy {} after retries", upstream_addr))?;
 
     // Build request with Proxy-Authorization header
     let mut request = String::new();
