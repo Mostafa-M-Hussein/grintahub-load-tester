@@ -132,6 +132,9 @@ struct SessionFingerprint {
     memory_gb: u8,
     cpu_cores: u8,
     consent_id: u16,
+    gpu: Gpu,
+    /// Unique per-session seed for Canvas/WebGL/Audio noise
+    noise_seed: u32,
 }
 
 impl SessionFingerprint {
@@ -180,6 +183,25 @@ impl SessionFingerprint {
         // CONSENT cookie random ID
         let consent_id = rng.gen_range(100..=999);
 
+        // GPU — weighted pick from Windows-compatible GPUs
+        let gpu = {
+            let roll: f64 = rng.gen();
+            if roll < 0.30 {
+                Gpu::NvidiaGTX1660  // Common mid-range
+            } else if roll < 0.55 {
+                Gpu::IntelUHD630    // Very common laptop/desktop
+            } else if roll < 0.70 {
+                Gpu::IntelIrisXe    // Modern laptops
+            } else if roll < 0.85 {
+                Gpu::NvidiaRTX3080  // Gaming
+            } else {
+                Gpu::NvidiaRTX4080  // High-end
+            }
+        };
+
+        // Unique noise seed for Canvas/WebGL/AudioContext per session
+        let noise_seed: u32 = rng.gen();
+
         Self {
             screen_width,
             screen_height,
@@ -192,20 +214,23 @@ impl SessionFingerprint {
             memory_gb,
             cpu_cores,
             consent_id,
+            gpu,
+            noise_seed,
         }
     }
 
     /// Log a summary of this fingerprint for debugging.
     fn log_summary(&self, session_id: &str) {
         info!(
-            "Session {} fingerprint: screen={}x{}, lang={}, window=({},{}), geo=({:.4},{:.4}), RAM={}GB, CPU={}, consent=PENDING+{}",
+            "Session {} fingerprint: screen={}x{}, gpu={:?}, lang={}, window=({},{}), geo=({:.4},{:.4}), RAM={}GB, CPU={}, noise={:08x}",
             session_id,
             self.screen_width, self.screen_height,
+            self.gpu,
             self.accept_language,
             self.window_x, self.window_y,
             self.geo_lat, self.geo_lng,
             self.memory_gb, self.cpu_cores,
-            self.consent_id,
+            self.noise_seed,
         );
     }
 }
@@ -223,7 +248,7 @@ fn create_saudi_profile(chrome_major: u32, fingerprint: &SessionFingerprint) -> 
     };
     base
         .chrome_version(chrome_major)
-        .gpu(Gpu::NvidiaGTX1660) // Single GPU — no rotation (reduces fingerprint entropy)
+        .gpu(fingerprint.gpu.clone()) // Per-session GPU rotation
         .memory_gb(fingerprint.memory_gb as u32)
         .cpu_cores(fingerprint.cpu_cores as u32)
         .locale("ar-SA")
@@ -691,10 +716,16 @@ impl BrowserSession {
         // 4) Pre-set Google cookies to look like a returning user (not a fresh bot)
         Self::pre_set_google_cookies(chaser.raw_page(), &fingerprint).await?;
 
+        // 5) Minimal fingerprint noise (Canvas, WebGL, AudioContext, hardware)
+        // Uses AddScriptToEvaluateOnNewDocument — persists across navigations.
+        // INTENTIONALLY minimal: only noise injection + hardware values.
+        // No toString patches, no prototype hacks, no navigator overrides.
+        Self::inject_fingerprint_noise(chaser.raw_page(), &fingerprint).await?;
+
         // Block unnecessary resources to reduce proxy bandwidth consumption
         Self::block_unnecessary_resources(chaser.raw_page()).await?;
 
-        info!("Browser session {} created (CDP-only, zero JS overrides, Chrome {})", session_id, chrome_full_ver);
+        info!("Browser session {} created (CDP + fingerprint noise, Chrome {})", session_id, chrome_full_ver);
 
         Ok(Self {
             id: session_id,
@@ -1640,11 +1671,135 @@ impl BrowserSession {
         Ok(())
     }
 
-    // Anti-detection approach: ZERO JavaScript modifications
+    /// Inject minimal per-session fingerprint noise via AddScriptToEvaluateOnNewDocument.
+    ///
+    /// This is INTENTIONALLY minimal (6 modifications) to avoid Google detection.
+    /// The previous approach (37 prototype modifications) caused CAPTCHAs on every search.
+    ///
+    /// What this does:
+    /// 1. Canvas noise — adds per-session pixel noise to toDataURL/getImageData
+    /// 2. WebGL renderer/vendor — spoofs GPU identity per session
+    /// 3. AudioContext noise — adds per-session noise to getChannelData
+    /// 4. navigator.hardwareConcurrency — per-session CPU cores
+    /// 5. navigator.deviceMemory — per-session RAM
+    /// 6. performance.memory — randomized heap sizes
+    async fn inject_fingerprint_noise(page: &Page, fingerprint: &SessionFingerprint) -> Result<(), BrowserError> {
+        use chaser_oxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
+
+        let gpu = fingerprint.gpu;
+        let webgl_vendor = gpu.vendor();
+        let webgl_renderer = gpu.renderer();
+        let seed = fingerprint.noise_seed;
+        let cores = fingerprint.cpu_cores;
+        let mem_gb = fingerprint.memory_gb;
+
+        // Minimal fingerprint noise script — no toString patches, no prototype hacks
+        let script = format!(
+            r#"(function() {{
+    'use strict';
+    var S = {seed} >>> 0;
+    function xorshift(s) {{ s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s >>> 0; }}
+    function noise(s, i) {{ var v = xorshift(s + i); return ((v % 3) - 1); }}
+
+    // 1) Canvas noise — modify pixel data slightly per session
+    var origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+    CanvasRenderingContext2D.prototype.getImageData = function() {{
+        var d = origGetImageData.apply(this, arguments);
+        for (var i = 0; i < d.data.length; i += 37) {{
+            d.data[i] = (d.data[i] + noise(S, i)) & 255;
+        }}
+        return d;
+    }};
+
+    var origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    HTMLCanvasElement.prototype.toDataURL = function() {{
+        var ctx = this.getContext && this.getContext('2d');
+        if (ctx) {{
+            try {{
+                var d = origGetImageData.call(ctx, 0, 0, Math.min(this.width, 16), Math.min(this.height, 16));
+                for (var i = 0; i < d.data.length; i += 23) {{ d.data[i] = (d.data[i] + noise(S, i + 7)) & 255; }}
+                ctx.putImageData(d, 0, 0);
+            }} catch(e) {{}}
+        }}
+        return origToDataURL.apply(this, arguments);
+    }};
+
+    // 2) WebGL renderer/vendor spoof
+    var origGetParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(p) {{
+        if (p === 37445) return '{webgl_vendor}';
+        if (p === 37446) return '{webgl_renderer}';
+        return origGetParam.call(this, p);
+    }};
+    if (typeof WebGL2RenderingContext !== 'undefined') {{
+        var origGetParam2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(p) {{
+            if (p === 37445) return '{webgl_vendor}';
+            if (p === 37446) return '{webgl_renderer}';
+            return origGetParam2.call(this, p);
+        }};
+    }}
+
+    // 3) AudioContext noise
+    var origGetChannelData = AudioBuffer.prototype.getChannelData;
+    AudioBuffer.prototype.getChannelData = function(ch) {{
+        var buf = origGetChannelData.call(this, ch);
+        if (buf.length > 0) {{
+            var s = S + ch;
+            for (var i = 0; i < buf.length; i += 101) {{
+                s = xorshift(s + i);
+                buf[i] += (s % 100 - 50) * 0.0000001;
+            }}
+        }}
+        return buf;
+    }};
+
+    // 4) Hardware: CPU cores + device memory
+    Object.defineProperty(navigator, 'hardwareConcurrency', {{ value: {cores}, configurable: true }});
+    Object.defineProperty(navigator, 'deviceMemory', {{ value: {mem_gb}, configurable: true }});
+
+    // 5) performance.memory (Chrome-specific)
+    if (window.performance) {{
+        var heapBase = {mem_gb} * 1073741824;
+        var used = Math.floor(heapBase * (0.15 + (S % 100) * 0.003));
+        var total = Math.floor(heapBase * (0.3 + (S % 50) * 0.004));
+        try {{
+            Object.defineProperty(performance, 'memory', {{
+                get: function() {{ return {{ jsHeapSizeLimit: heapBase, totalJSHeapSize: total, usedJSHeapSize: used }}; }},
+                configurable: true
+            }});
+        }} catch(e) {{}}
+    }}
+}})();"#,
+            seed = seed,
+            webgl_vendor = webgl_vendor,
+            webgl_renderer = webgl_renderer,
+            cores = cores,
+            mem_gb = mem_gb,
+        );
+
+        let params = AddScriptToEvaluateOnNewDocumentParams {
+            source: script,
+            world_name: None,
+            include_command_line_api: None,
+            run_immediately: None,
+        };
+
+        page.execute(params)
+            .await
+            .map_err(|e| BrowserError::LaunchFailed(format!("Failed to inject fingerprint noise: {}", e)))?;
+
+        debug!("Fingerprint noise injected: gpu={:?}, seed={:08x}, cores={}, mem={}GB",
+            fingerprint.gpu, seed, cores, mem_gb);
+        Ok(())
+    }
+
+    // Anti-detection approach: Minimal JavaScript modifications
     //
-    // Google detects JS prototype modifications (navigator overrides, toString patches, etc.)
-    // Before chaser-oxide: CAPTCHAs were rare. After: CAPTCHAs on every search.
-    // Root cause: bootstrap_script + extra_evasions.js modified ~37 JS prototypes.
+    // Google detects HEAVY JS prototype modifications (37+ overrides caused CAPTCHAs).
+    // Current approach: CDP-level overrides + minimal noise injection (6 modifications).
+    // The noise script only adds randomness to Canvas/WebGL/Audio data — doesn't modify
+    // navigator properties that Google actively checks via toString() inspection.
     //
     // New approach — CDP-level only (invisible to JavaScript):
     // 1. Auto-detect Chrome version from installed binary (MUST match real browser)
