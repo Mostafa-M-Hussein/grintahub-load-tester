@@ -118,12 +118,104 @@ fn find_chrome() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+/// Per-session fingerprint — all random values generated once at session creation.
+/// Ensures internal consistency (screen.width matches window size, etc.).
+struct SessionFingerprint {
+    screen_width: u32,
+    screen_height: u32,
+    accept_language: String,
+    accept_language_header: String,
+    window_x: i32,
+    window_y: i32,
+    geo_lat: f64,
+    geo_lng: f64,
+    memory_gb: u8,
+    cpu_cores: u8,
+    consent_id: u16,
+}
+
+impl SessionFingerprint {
+    /// Generate a random fingerprint for a new session.
+    fn random() -> Self {
+        let mut rng = rand::thread_rng();
+
+        // Screen resolution — weighted pick from common resolutions
+        let (screen_width, screen_height) = {
+            let roll: f64 = rng.gen();
+            if roll < 0.40 {
+                (1920, 1080)
+            } else if roll < 0.65 {
+                (1366, 768)
+            } else if roll < 0.80 {
+                (1536, 864)
+            } else if roll < 0.90 {
+                (1440, 900)
+            } else {
+                (1280, 720)
+            }
+        };
+
+        // Accept-Language — pick one variant per session
+        let lang_variants = [
+            ("ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7", "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7"),
+            ("ar,ar-SA;q=0.9,en;q=0.8", "ar,ar-SA;q=0.9,en;q=0.8"),
+            ("ar-SA,en-US;q=0.9,ar;q=0.8,en;q=0.7", "ar-SA,en-US;q=0.9,ar;q=0.8,en;q=0.7"),
+            ("en-US,ar-SA;q=0.9,ar;q=0.8,en;q=0.7", "en-US,ar-SA;q=0.9,ar;q=0.8,en;q=0.7"),
+        ];
+        let lang_idx = rng.gen_range(0..lang_variants.len());
+        let (accept_language, accept_language_header) = lang_variants[lang_idx];
+
+        // Window position — random offset
+        let window_x = rng.gen_range(0..=300);
+        let window_y = rng.gen_range(0..=150);
+
+        // Geolocation jitter — ±0.03 degrees (~3km) around Riyadh center
+        let geo_lat = 24.7136 + rng.gen_range(-0.03..=0.03);
+        let geo_lng = 46.6753 + rng.gen_range(-0.03..=0.03);
+
+        // Hardware — weighted picks
+        let memory_gb = *[4u8, 8, 8, 16].get(rng.gen_range(0..4)).unwrap();
+        let cpu_cores = *[4u8, 6, 8, 8].get(rng.gen_range(0..4)).unwrap();
+
+        // CONSENT cookie random ID
+        let consent_id = rng.gen_range(100..=999);
+
+        Self {
+            screen_width,
+            screen_height,
+            accept_language: accept_language.to_string(),
+            accept_language_header: accept_language_header.to_string(),
+            window_x,
+            window_y,
+            geo_lat,
+            geo_lng,
+            memory_gb,
+            cpu_cores,
+            consent_id,
+        }
+    }
+
+    /// Log a summary of this fingerprint for debugging.
+    fn log_summary(&self, session_id: &str) {
+        info!(
+            "Session {} fingerprint: screen={}x{}, lang={}, window=({},{}), geo=({:.4},{:.4}), RAM={}GB, CPU={}, consent=PENDING+{}",
+            session_id,
+            self.screen_width, self.screen_height,
+            self.accept_language,
+            self.window_x, self.window_y,
+            self.geo_lat, self.geo_lng,
+            self.memory_gb, self.cpu_cores,
+            self.consent_id,
+        );
+    }
+}
+
 /// Create a ChaserProfile configured for Saudi Arabia
 /// Uses platform-aware profile: Windows on Windows, Linux on Linux/Docker.
 /// This avoids TLS/fingerprint mismatch detection — Google compares the claimed
 /// platform in headers against the actual OS-level TLS cipher suites and socket behavior.
 /// Chrome version is auto-detected from the installed binary for consistency.
-fn create_saudi_profile(chrome_major: u32) -> ChaserProfile {
+fn create_saudi_profile(chrome_major: u32, fingerprint: &SessionFingerprint) -> ChaserProfile {
     let base = if cfg!(target_os = "windows") {
         ChaserProfile::windows()
     } else {
@@ -132,11 +224,11 @@ fn create_saudi_profile(chrome_major: u32) -> ChaserProfile {
     base
         .chrome_version(chrome_major)
         .gpu(Gpu::NvidiaGTX1660) // Single GPU — no rotation (reduces fingerprint entropy)
-        .memory_gb(8)
-        .cpu_cores(8)
+        .memory_gb(fingerprint.memory_gb as u32)
+        .cpu_cores(fingerprint.cpu_cores as u32)
         .locale("ar-SA")
         .timezone("Asia/Riyadh")
-        .screen(1920, 1080)
+        .screen(fingerprint.screen_width, fingerprint.screen_height)
         .build()
 }
 
@@ -383,12 +475,17 @@ impl BrowserSession {
             builder = builder.user_data_dir(dir);
         }
 
+        // Generate per-session fingerprint (all random values decided once)
+        let fingerprint = SessionFingerprint::random();
+        fingerprint.log_summary(&session_id);
+
         // =========== STEALTH FLAGS (chaser-oxide Arg API) ===========
         // IMPORTANT: Keys must NOT include "--" prefix — ArgsBuilder adds it automatically.
         // Use "flag" for boolean flags, ("key", "value") for key=value pairs.
         // Many flags (no-first-run, disable-sync, disable-dev-shm-usage, etc.)
         // are already in chaser-oxide's DEFAULT_ARGS and don't need repeating.
 
+        let window_pos = format!("{},{}", fingerprint.window_x, fingerprint.window_y);
         builder = builder
             // Anti-detection (undetected-chromedriver style)
             .arg(("disable-blink-features", "AutomationControlled"))
@@ -397,8 +494,8 @@ impl BrowserSession {
             .arg("disable-infobars")
             .arg("no-default-browser-check")
 
-            // Window position (size is set via builder.window_size())
-            .arg(("window-position", "50,50"))
+            // Window position — randomized per session
+            .arg(("window-position", window_pos.as_str()))
 
             // Disable features (merged into ONE call — HashMap overwrites duplicate keys)
             // DEFAULT_ARGS has TranslateUI, we must include it plus our extras
@@ -443,7 +540,7 @@ impl BrowserSession {
 
         // ChaserProfile handles: user-agent, lang, timezone, platform
         // Chrome version must match the installed binary for consistency
-        let profile = create_saudi_profile(chrome_major);
+        let profile = create_saudi_profile(chrome_major, &fingerprint);
         info!("Session {} using profile: {} (full ver: {})", session_id, profile, chrome_full_ver);
 
         builder = builder
@@ -517,8 +614,8 @@ impl BrowserSession {
             ));
         }
 
-        // Set window size
-        builder = builder.window_size(config.window_width, config.window_height);
+        // Set window size from fingerprint (overrides config defaults)
+        builder = builder.window_size(fingerprint.screen_width, fingerprint.screen_height);
 
         let browser_config = builder.build()
             .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
@@ -583,16 +680,16 @@ impl BrowserSession {
         // This sets it to false at the C++ level, not JavaScript level.
 
         // 1) CDP User-Agent + Metadata (sets UA string, Sec-CH-UA headers, Accept-Language)
-        Self::set_cdp_headers(chaser.raw_page(), &profile, &chrome_full_ver).await?;
+        Self::set_cdp_headers(chaser.raw_page(), &profile, &chrome_full_ver, &fingerprint).await?;
 
         // 2) CDP Timezone Override (sets Date.getTimezoneOffset and Intl.DateTimeFormat natively)
         Self::set_timezone_override(chaser.raw_page()).await?;
 
-        // Override geolocation to Riyadh (24.7136°N, 46.6753°E) via CDP
-        Self::set_geolocation_riyadh(chaser.raw_page()).await?;
+        // Override geolocation to Riyadh with per-session jitter via CDP
+        Self::set_geolocation_riyadh(chaser.raw_page(), &fingerprint).await?;
 
         // 4) Pre-set Google cookies to look like a returning user (not a fresh bot)
-        Self::pre_set_google_cookies(chaser.raw_page()).await?;
+        Self::pre_set_google_cookies(chaser.raw_page(), &fingerprint).await?;
 
         // Block unnecessary resources to reduce proxy bandwidth consumption
         Self::block_unnecessary_resources(chaser.raw_page()).await?;
@@ -1296,7 +1393,7 @@ impl BrowserSession {
     /// NOTE: We do NOT set Sec-CH-UA via SetExtraHttpHeaders because
     /// SetUserAgentOverrideParams with user_agent_metadata already handles all
     /// Sec-CH-UA-* headers. Double-setting them causes conflicts.
-    async fn set_cdp_headers(page: &Page, profile: &ChaserProfile, full_version: &str) -> Result<(), BrowserError> {
+    async fn set_cdp_headers(page: &Page, profile: &ChaserProfile, full_version: &str, fingerprint: &SessionFingerprint) -> Result<(), BrowserError> {
         use chaser_oxide::cdp::browser_protocol::emulation::{
             SetUserAgentOverrideParams, UserAgentMetadata, UserAgentBrandVersion,
         };
@@ -1324,7 +1421,7 @@ impl BrowserSession {
         // Brand string "Not=A?Brand" matches ChaserProfile bootstrap_script exactly
         let ua_params = SetUserAgentOverrideParams {
             user_agent: real_ua,
-            accept_language: Some("ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7".to_string()),
+            accept_language: Some(fingerprint.accept_language.clone()),
             platform: Some(platform_str.to_string()),
             user_agent_metadata: Some(UserAgentMetadata {
                 brands: Some(vec![
@@ -1356,7 +1453,7 @@ impl BrowserSession {
         // Sec-CH-UA headers are handled by user_agent_metadata above.
         // Setting them in BOTH places causes double-header conflicts.
         let headers_json = serde_json::json!({
-            "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7"
+            "Accept-Language": fingerprint.accept_language_header
         });
 
         let extra_headers = SetExtraHttpHeadersParams::new(Headers::new(headers_json));
@@ -1364,7 +1461,7 @@ impl BrowserSession {
             .await
             .map_err(|e| BrowserError::LaunchFailed(format!("Failed to set extra headers: {}", e)))?;
 
-        debug!("CDP headers set: Chrome/{}, Platform={}, Accept-Language=ar-SA", full_version, platform_meta);
+        debug!("CDP headers set: Chrome/{}, Platform={}, Accept-Language={}", full_version, platform_meta, fingerprint.accept_language);
         Ok(())
     }
 
@@ -1473,13 +1570,13 @@ impl BrowserSession {
         Ok(())
     }
 
-    /// Override geolocation to Riyadh, Saudi Arabia via CDP
-    async fn set_geolocation_riyadh(page: &Page) -> Result<(), BrowserError> {
+    /// Override geolocation to Riyadh, Saudi Arabia via CDP (with per-session jitter)
+    async fn set_geolocation_riyadh(page: &Page, fingerprint: &SessionFingerprint) -> Result<(), BrowserError> {
         use chaser_oxide::cdp::browser_protocol::emulation::SetGeolocationOverrideParams;
 
         let params = SetGeolocationOverrideParams::builder()
-            .latitude(24.7136)
-            .longitude(46.6753)
+            .latitude(fingerprint.geo_lat)
+            .longitude(fingerprint.geo_lng)
             .accuracy(100.0)
             .build();
 
@@ -1487,21 +1584,21 @@ impl BrowserSession {
             .await
             .map_err(|e| BrowserError::JavaScriptError(format!("Failed to set geolocation: {}", e)))?;
 
-        info!("Geolocation overridden to Riyadh (24.7136, 46.6753)");
+        info!("Geolocation overridden to Riyadh ({:.4}, {:.4})", fingerprint.geo_lat, fingerprint.geo_lng);
         Ok(())
     }
 
     /// Pre-set Google cookies via CDP to look like a returning user.
     /// A fresh browser with zero cookies is a strong bot signal to Google.
     /// Sets CONSENT (accepted cookies) and PREF (language/country) before any navigation.
-    async fn pre_set_google_cookies(page: &Page) -> Result<(), BrowserError> {
+    async fn pre_set_google_cookies(page: &Page, fingerprint: &SessionFingerprint) -> Result<(), BrowserError> {
         use chaser_oxide::cdp::browser_protocol::network::{SetCookiesParams, CookieParam};
 
         let cookies = vec![
             // CONSENT cookie — tells Google consent dialog was already accepted
             CookieParam::builder()
                 .name("CONSENT")
-                .value("PENDING+987")
+                .value(&format!("PENDING+{}", fingerprint.consent_id))
                 .domain(".google.com.sa")
                 .path("/")
                 .secure(true)
@@ -1510,7 +1607,7 @@ impl BrowserSession {
             // Also set for .google.com (some redirects go through google.com)
             CookieParam::builder()
                 .name("CONSENT")
-                .value("PENDING+987")
+                .value(&format!("PENDING+{}", fingerprint.consent_id))
                 .domain(".google.com")
                 .path("/")
                 .secure(true)
